@@ -82,11 +82,21 @@ export async function fetchSchoolStateFromSupabase(
       settingsRes.error ||
       classesRes.error ||
       subjectsRes.error ||
+      loRes.error ||
       studentsRes.error ||
       gradesRes.error ||
-      homeroomRes.error;
+      homeroomRes.error ||
+      submissionsRes.error;
 
     if (firstError) {
+      const msgLower = firstError.message.toLowerCase();
+      if (firstError.code === '42501' || msgLower.includes('permission denied')) {
+        return {
+          ok: false,
+          error:
+            'Akses baca tabel Supabase ditolak (42501 permission denied). Pastikan Anda masuk dengan akun yang terdaftar di Supabase Authentication (dengan role yang sesuai di tabel profiles) dan skrip SQL RLS/GRANT terbaru sudah dijalankan di Supabase SQL Editor.',
+        };
+      }
       return { ok: false, error: firstError.message };
     }
 
@@ -306,6 +316,17 @@ export async function fetchSchoolStateFromSupabase(
   }
 }
 
+function formatSupabaseSyncError(table: string, err: { code?: string; message: string }): string {
+  const lower = err.message.toLowerCase();
+  if (err.code === '42501' || lower.includes('permission denied') || lower.includes('row-level security')) {
+    return `Izin simpan ke tabel "${table}" ditolak RLS/GRANT (${err.message}). Pastikan akun Anda login melalui Supabase Auth dan memiliki role yang sesuai di tabel profiles.`;
+  }
+  if (err.code === '42P01' || lower.includes('does not exist')) {
+    return `Tabel "${table}" belum tersedia di Supabase. Jalankan skrip SQL di tab Database Supabase & SQL.`;
+  }
+  return `Gagal menyinkronkan tabel "${table}": ${err.message}`;
+}
+
 export async function syncSchoolDataToSupabase(
   client: SupabaseClient,
   payload: {
@@ -318,9 +339,18 @@ export async function syncSchoolDataToSupabase(
     homeroomRecords: HomeroomRecord[];
     gradeSubmissions: GradeSubmission[];
   }
-): Promise<void> {
+): Promise<{ ok: boolean; error?: string }> {
   const { role, settings, classes, subjects, students, grades, homeroomRecords, gradeSubmissions } =
     payload;
+
+  const { data: sessionData } = await client.auth.getSession();
+  if (!sessionData.session) {
+    return {
+      ok: false,
+      error:
+        'Sesi login Supabase Auth belum aktif (data tersimpan di server sekolah/lokal). Masuk menggunakan akun yang terdaftar di Supabase Authentication untuk menyinkronkan ke database Supabase.',
+    };
+  }
 
   // Fetch valid Supabase profile IDs to avoid FK violation on teacher_id/homeroom_teacher_id
   let validProfileIds = new Set<string>();
@@ -358,7 +388,10 @@ export async function syncSchoolDataToSupabase(
       auto_prk_formula: settings.autoPrkFormula,
     };
     if (isUuid(settings.id)) {
-      await client.from('school_settings').upsert(settingsRow, { onConflict: 'id' });
+      const { error } = await client
+        .from('school_settings')
+        .upsert(settingsRow, { onConflict: 'id' });
+      if (error) return { ok: false, error: formatSupabaseSyncError('school_settings', error) };
     }
 
     if (classes.length > 0) {
@@ -376,7 +409,8 @@ export async function syncSchoolDataToSupabase(
           academic_year: c.academicYear,
         }));
       if (classRows.length > 0) {
-        await client.from('classes').upsert(classRows, { onConflict: 'id' });
+        const { error } = await client.from('classes').upsert(classRows, { onConflict: 'id' });
+        if (error) return { ok: false, error: formatSupabaseSyncError('classes', error) };
       }
     }
 
@@ -396,7 +430,8 @@ export async function syncSchoolDataToSupabase(
           sort_order: s.sortOrder,
         }));
       if (subRows.length > 0) {
-        await client.from('subjects').upsert(subRows, { onConflict: 'id' });
+        const { error } = await client.from('subjects').upsert(subRows, { onConflict: 'id' });
+        if (error) return { ok: false, error: formatSupabaseSyncError('subjects', error) };
       }
     }
 
@@ -419,7 +454,8 @@ export async function syncSchoolDataToSupabase(
           is_active: st.isActive,
         }));
       if (stuRows.length > 0) {
-        await client.from('students').upsert(stuRows, { onConflict: 'id' });
+        const { error } = await client.from('students').upsert(stuRows, { onConflict: 'id' });
+        if (error) return { ok: false, error: formatSupabaseSyncError('students', error) };
       }
     }
   }
@@ -448,7 +484,10 @@ export async function syncSchoolDataToSupabase(
     });
   });
   if (loRows.length > 0) {
-    await client.from('learning_objectives').upsert(loRows, { onConflict: 'id' });
+    const { error } = await client
+      .from('learning_objectives')
+      .upsert(loRows, { onConflict: 'id' });
+    if (error) return { ok: false, error: formatSupabaseSyncError('learning_objectives', error) };
   }
 
   // Staff sync grades
@@ -473,9 +512,10 @@ export async function syncSchoolDataToSupabase(
       deskripsi_manual: g.deskripsiManual || null,
     }));
   if (validGradeRows.length > 0) {
-    await client
+    const { error } = await client
       .from('student_grades')
       .upsert(validGradeRows, { onConflict: 'student_id,subject_id,academic_year,semester' });
+    if (error) return { ok: false, error: formatSupabaseSyncError('student_grades', error) };
   }
 
   if (role === 'admin' || role === 'wali_kelas') {
@@ -495,9 +535,10 @@ export async function syncSchoolDataToSupabase(
         p5_projects: hr.p5Projects,
       }));
     if (validHrRows.length > 0) {
-      await client
+      const { error } = await client
         .from('homeroom_records')
         .upsert(validHrRows, { onConflict: 'student_id,academic_year,semester' });
+      if (error) return { ok: false, error: formatSupabaseSyncError('homeroom_records', error) };
     }
   }
 
@@ -515,8 +556,11 @@ export async function syncSchoolDataToSupabase(
       note: sub.note || null,
     }));
   if (validSubRows.length > 0) {
-    await client
+    const { error } = await client
       .from('grade_submissions')
       .upsert(validSubRows, { onConflict: 'class_id,subject_id,academic_year,semester' });
+    if (error) return { ok: false, error: formatSupabaseSyncError('grade_submissions', error) };
   }
+
+  return { ok: true };
 }

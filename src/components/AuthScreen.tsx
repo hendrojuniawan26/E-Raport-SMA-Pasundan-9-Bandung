@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
@@ -15,10 +15,10 @@ import {
   RefreshCw,
   ShieldCheck,
   UserCheck,
-  UserPlus,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { getSupabaseConfig } from '../lib/supabase';
+import { UserRole } from '../types/raport';
 import { SchoolCrest } from './SchoolCrest';
 
 export function AuthScreen() {
@@ -26,32 +26,16 @@ export function AuthScreen() {
     authStatus,
     refreshAuthStatus,
     loginWithEmailPassword,
-    registerTeacherAccount,
     claimFirstAdmin,
-    classes,
     settings,
     connectionMode,
   } = useApp();
 
-  const [authTab, setAuthTab] = useState<'login' | 'register' | 'claim_admin'>('login');
+  const [authTab, setAuthTab] = useState<'login' | 'claim_admin'>('login');
+  const [loginRole, setLoginRole] = useState<UserRole>('admin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-
-  // Teacher / Homeroom registration state
-  const [regRole, setRegRole] = useState<'guru' | 'wali_kelas'>('guru');
-  const [regClassId, setRegClassId] = useState<string>(classes[0]?.id || '');
-  const [regName, setRegName] = useState('');
-  const [regNip, setRegNip] = useState('');
-  const [regEmail, setRegEmail] = useState('');
-  const [regPassword, setRegPassword] = useState('');
-  const [regConfirm, setRegConfirm] = useState('');
-
-  useEffect(() => {
-    if (!regClassId && classes.length > 0) {
-      setRegClassId(classes[0].id);
-    }
-  }, [classes, regClassId]);
 
   // First-run Admin claim state
   const [claimEmail, setClaimEmail] = useState('');
@@ -77,37 +61,7 @@ export function AuthScreen() {
     e.preventDefault();
     setError('');
     setLoading(true);
-    const res = await loginWithEmailPassword(email, password);
-    setLoading(false);
-    if (!res.ok && res.error) {
-      setError(res.error);
-    }
-  };
-
-  const handleRegisterSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    if (regName.trim().length < 2) {
-      setError('Nama lengkap & gelar minimal 2 karakter.');
-      return;
-    }
-    if (regPassword.length < 6) {
-      setError('Kata sandi minimal 6 karakter.');
-      return;
-    }
-    if (regPassword !== regConfirm) {
-      setError('Konfirmasi kata sandi tidak cocok.');
-      return;
-    }
-    setLoading(true);
-    const res = await registerTeacherAccount({
-      email: regEmail,
-      fullName: regName,
-      nipNuptk: regNip,
-      role: regRole,
-      assignedClassId: regRole === 'wali_kelas' ? regClassId : undefined,
-      password: regPassword,
-    });
+    const res = await loginWithEmailPassword(email, password, loginRole);
     setLoading(false);
     if (!res.ok && res.error) {
       setError(res.error);
@@ -161,23 +115,40 @@ export function AuthScreen() {
     },
   ];
 
-  const roleSummaries = [
+  const roleOptions: {
+    id: UserRole;
+    title: string;
+    shortDesc: string;
+    desc: string;
+    placeholderEmail: string;
+    icon: React.ReactNode;
+  }[] = [
     {
+      id: 'admin',
       title: 'Admin / Operator',
+      shortDesc: 'Master data & sistem',
       desc: 'Data master siswa, akun guru, kelas IPAS Fase E/F, bobot & Supabase',
-      icon: <ShieldCheck className="w-4 h-4 text-emerald-700" />,
+      placeholderEmail: 'admin@guru.sma.belajar.id',
+      icon: <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0" />,
     },
     {
-      title: 'Guru Mata Pelajaran',
+      id: 'guru',
+      title: 'Guru Mapel',
+      shortDesc: 'TP, sikap & nilai mapel',
       desc: 'Atur TP, sikap P3, olah/impor nilai, kunci & kirim ke Wali Kelas',
-      icon: <BookOpen className="w-4 h-4 text-emerald-700" />,
+      placeholderEmail: 'guru@smapasundan9bdg.sch.id',
+      icon: <BookOpen className="w-4 h-4 text-emerald-700 shrink-0" />,
     },
     {
+      id: 'wali_kelas',
       title: 'Wali Kelas',
+      shortDesc: 'Absensi, P5 & raport',
       desc: 'Input nilai mapel, absensi, ekskul, P5, leger & cetak raport A4/F4',
-      icon: <UserCheck className="w-4 h-4 text-emerald-700" />,
+      placeholderEmail: 'walikelas@smapasundan9bdg.sch.id',
+      icon: <UserCheck className="w-4 h-4 text-emerald-700 shrink-0" />,
     },
   ];
+  const selectedRoleOption = roleOptions.find((r) => r.id === loginRole) || roleOptions[0];
 
   return (
     <div className="min-h-screen bg-smart-grid flex flex-col justify-center py-8 px-4 sm:px-6 lg:px-8">
@@ -249,18 +220,14 @@ export function AuthScreen() {
           <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
             <div>
               <h3 className="text-xl font-bold tracking-tight text-slate-900">
-                {authTab === 'register'
-                  ? 'Pendaftaran Akun Guru / Wali Kelas'
-                  : authTab === 'claim_admin'
-                    ? 'Aktivasi Admin Utama'
-                    : 'Masuk ke Portal Akademik'}
+                {authTab === 'claim_admin'
+                  ? 'Aktivasi Admin Utama'
+                  : 'Masuk ke Portal Akademik'}
               </h3>
               <p className="text-xs sm:text-sm text-slate-500 mt-1">
-                {authTab === 'register'
-                  ? 'Buat kata sandi atau aktifkan akun sekolah Anda untuk mulai mengolah nilai.'
-                  : authTab === 'claim_admin'
-                    ? 'Atur kata sandi Admin sekolah untuk mengelola data master dan pengguna.'
-                    : 'Gunakan email dan kata sandi akun sekolah Anda yang sudah terdaftar.'}
+                {authTab === 'claim_admin'
+                  ? 'Atur kata sandi Admin sekolah untuk mengelola data master dan pengguna.'
+                  : 'Gunakan email dan kata sandi akun sekolah Anda yang telah didaftarkan oleh Admin.'}
               </p>
             </div>
           </div>
@@ -273,7 +240,7 @@ export function AuthScreen() {
                   <div>
                     <div className="font-semibold">Mode Autentikasi Langsung Supabase Aktif</div>
                     <p className="text-sky-800/90 mt-0.5 leading-relaxed">
-                      Aplikasi terhubung langsung ke Supabase Cloud. Anda dapat masuk atau mendaftar akun Guru / Wali Kelas melalui Supabase Auth dari browser mana saja.
+                      Aplikasi terhubung ke Supabase Cloud. Masuk menggunakan akun yang telah didaftarkan dan diaktifkan oleh Admin Sekolah.
                     </p>
                   </div>
                 </div>
@@ -309,36 +276,22 @@ export function AuthScreen() {
             )
           )}
 
-          <div className="inline-flex flex-wrap p-1 bg-slate-100 rounded-xl border border-slate-200 mb-5 self-start">
-            <button
-              type="button"
-              onClick={() => {
-                setAuthTab('login');
-                setError('');
-              }}
-              className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
-                authTab === 'login'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Masuk Akun
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setAuthTab('register');
-                setError('');
-              }}
-              className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
-                authTab === 'register'
-                  ? 'bg-white text-emerald-800 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Daftar Guru / Wali
-            </button>
-            {canClaimAdmin && (
+          {canClaimAdmin && (
+            <div className="inline-flex flex-wrap p-1 bg-slate-100 rounded-xl border border-slate-200 mb-5 self-start">
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthTab('login');
+                  setError('');
+                }}
+                className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+                  authTab === 'login'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Masuk Akun
+              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -353,8 +306,8 @@ export function AuthScreen() {
               >
                 Aktivasi Admin
               </button>
-            )}
-          </div>
+            </div>
+          )}
 
           {authTab === 'claim_admin' && canClaimAdmin ? (
             <form onSubmit={handleClaimAdminSubmit} className="space-y-3.5">
@@ -453,163 +406,47 @@ export function AuthScreen() {
                 <span>{loading ? 'Mengaktifkan...' : 'Aktifkan & Masuk sebagai Admin'}</span>
               </button>
             </form>
-          ) : authTab === 'register' ? (
-            <form onSubmit={handleRegisterSubmit} className="space-y-3.5">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                  Peran Tugas di Sekolah
-                </label>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setRegRole('guru')}
-                    className={`flex items-center gap-2 p-2.5 rounded-xl border text-left transition-colors ${
-                      regRole === 'guru'
-                        ? 'bg-emerald-50 border-emerald-600 text-emerald-900'
-                        : 'bg-slate-50/70 border-slate-200 text-slate-700 hover:bg-slate-100'
-                    }`}
-                  >
-                    <BookOpen className="w-4 h-4 text-emerald-700 shrink-0" />
-                    <div>
-                      <div className="text-xs font-semibold">Guru Mata Pelajaran</div>
-                      <div className="text-[11px] text-slate-500">Input nilai & sikap mapel</div>
-                    </div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setRegRole('wali_kelas')}
-                    className={`flex items-center gap-2 p-2.5 rounded-xl border text-left transition-colors ${
-                      regRole === 'wali_kelas'
-                        ? 'bg-emerald-50 border-emerald-600 text-emerald-900'
-                        : 'bg-slate-50/70 border-slate-200 text-slate-700 hover:bg-slate-100'
-                    }`}
-                  >
-                    <UserCheck className="w-4 h-4 text-emerald-700 shrink-0" />
-                    <div>
-                      <div className="text-xs font-semibold">Wali Kelas</div>
-                      <div className="text-[11px] text-slate-500">Kelola kelas & cetak raport</div>
-                    </div>
-                  </button>
-                </div>
-              </div>
-
-              {regRole === 'wali_kelas' && (
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Kelas Binaan
-                  </label>
-                  <select
-                    value={regClassId}
-                    onChange={(e) => setRegClassId(e.target.value)}
-                    className="w-full px-3 py-2 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
-                  >
-                    {classes.length === 0 ? (
-                      <option value="">Belum ada kelas (akan diatur oleh Admin)</option>
-                    ) : (
-                      classes.map((cls) => (
-                        <option key={cls.id} value={cls.id}>
-                          {cls.name} (Fase {cls.fase})
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </div>
-              )}
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Nama Lengkap & Gelar
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={regName}
-                    onChange={(e) => setRegName(e.target.value)}
-                    placeholder="Contoh: Drs. Ahmad Fauzi, M.Pd."
-                    className="w-full px-3 py-2 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    NIP / NUPTK
-                  </label>
-                  <input
-                    type="text"
-                    value={regNip}
-                    onChange={(e) => setRegNip(e.target.value)}
-                    placeholder="Opsional"
-                    className="w-full px-3 py-2 text-sm font-mono bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Email Sekolah
-                </label>
-                <input
-                  type="email"
-                  required
-                  value={regEmail}
-                  onChange={(e) => setRegEmail(e.target.value)}
-                  placeholder="nama@smapasundan9bdg.sch.id"
-                  className="w-full px-3 py-2 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Kata Sandi (Min. 6 Karakter)
-                  </label>
-                  <input
-                    type="password"
-                    required
-                    minLength={6}
-                    value={regPassword}
-                    onChange={(e) => setRegPassword(e.target.value)}
-                    placeholder="Buat kata sandi"
-                    className="w-full px-3 py-2 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Konfirmasi Kata Sandi
-                  </label>
-                  <input
-                    type="password"
-                    required
-                    minLength={6}
-                    value={regConfirm}
-                    onChange={(e) => setRegConfirm(e.target.value)}
-                    placeholder="Ulangi kata sandi"
-                    className="w-full px-3 py-2 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
-                  />
-                </div>
-              </div>
-
-              {error && (
-                <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
-                  {error}
-                </div>
-              )}
-
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors disabled:opacity-60"
-              >
-                <UserPlus className="w-4 h-4" />
-                <span>{loading ? 'Mendaftarkan Akun...' : 'Daftarkan Akun & Masuk'}</span>
-              </button>
-            </form>
           ) : (
             <div className="space-y-5">
               <form onSubmit={handleLoginSubmit} className="space-y-3.5">
                 <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+                    Pilih Role Akun
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    {roleOptions.map((item) => {
+                      const active = loginRole === item.id;
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => {
+                            setLoginRole(item.id);
+                            setError('');
+                          }}
+                          className={`flex items-start gap-2 p-2.5 rounded-xl border text-left transition-colors ${
+                            active
+                              ? 'bg-emerald-50 border-emerald-700 text-emerald-950 ring-1 ring-emerald-700/20'
+                              : 'bg-slate-50/70 border-slate-200 text-slate-700 hover:bg-slate-100'
+                          }`}
+                        >
+                          <div className="mt-0.5">{item.icon}</div>
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold truncate">{item.title}</div>
+                            <div className="text-[11px] text-slate-500 leading-tight mt-0.5">
+                              {item.shortDesc}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Email Sekolah
+                    Email {selectedRoleOption.title}
                   </label>
                   <input
                     type="email"
@@ -617,7 +454,7 @@ export function AuthScreen() {
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     className="w-full px-3.5 py-2.5 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-700 transition-colors"
-                    placeholder="nama@smapasundan9bdg.sch.id"
+                    placeholder={selectedRoleOption.placeholderEmail}
                   />
                 </div>
 
@@ -656,43 +493,25 @@ export function AuthScreen() {
                   disabled={loading}
                   className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors disabled:opacity-60 whitespace-nowrap"
                 >
-                  <span>{loading ? 'Memverifikasi...' : 'Masuk ke Portal Akademik'}</span>
+                  <span>
+                    {loading ? 'Memverifikasi...' : `Masuk sebagai ${selectedRoleOption.title}`}
+                  </span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               </form>
 
-              <div className="pt-4 border-t border-slate-200 space-y-2.5">
-                <div className="flex items-center justify-between text-xs">
+              <div className="pt-4 border-t border-slate-200 space-y-1.5">
+                <div className="flex items-center justify-between text-xs gap-2 flex-wrap">
                   <span className="font-semibold text-slate-700">
-                    Hak Akses Berbasis Peran
+                    Akses {selectedRoleOption.title}
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthTab('register');
-                      setError('');
-                    }}
-                    className="font-semibold text-emerald-700 hover:text-emerald-800"
-                  >
-                    Guru baru? Daftar di sini
-                  </button>
+                  <span className="text-[11px] font-medium text-slate-500">
+                    Pendaftaran akun hanya melalui Admin Sekolah
+                  </span>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                  {roleSummaries.map((item) => (
-                    <div
-                      key={item.title}
-                      className="p-2.5 rounded-xl bg-slate-50/80 border border-slate-200/80"
-                    >
-                      <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800">
-                        {item.icon}
-                        <span>{item.title}</span>
-                      </div>
-                      <p className="text-[11px] text-slate-500 mt-1 leading-snug">
-                        {item.desc}
-                      </p>
-                    </div>
-                  ))}
-                </div>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  {selectedRoleOption.desc}. Belum memiliki akun atau lupa sandi? Hubungi Admin Sekolah untuk dibuatkan akun aktif.
+                </p>
               </div>
             </div>
           )}

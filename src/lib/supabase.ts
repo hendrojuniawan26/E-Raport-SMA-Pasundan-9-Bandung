@@ -1,7 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-const RUNTIME_URL_KEY = 'https://mqoywabdvqsglzunaegs.supabase.co/';
-const RUNTIME_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1xb3l3YWJkdnFzZ2x6dW5hZWdzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTU0NjQ3MjgsImV4cCI6MjExMTA0MDcyOH0.LKNyOz4BvujaglaTrwSftLJCY6S-6qUYAtJwWdUdpVY';
+const RUNTIME_URL_KEY = 'pasundan9_supabase_url';
+const RUNTIME_ANON_KEY = 'pasundan9_supabase_anon_key';
 
 export type SupabaseConfigSource = 'env' | 'server' | 'local' | 'none';
 
@@ -197,15 +197,35 @@ export function getSupabaseClient(): SupabaseClient | null {
   }
 }
 
+export function createEphemeralSupabaseClient(): SupabaseClient | null {
+  const { url, anonKey } = getSupabaseConfig();
+  if (!url || !anonKey) return null;
+  try {
+    return createClient(url, anonKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+    });
+  } catch {
+    return null;
+  }
+}
+
 export async function testSupabaseConnection(): Promise<{
   ok: boolean;
   message: string;
+  tablesReady?: boolean;
+  hasSession?: boolean;
 }> {
   const cfg = getSupabaseConfig();
   const client = getSupabaseClient();
   if (!client) {
     return {
       ok: false,
+      tablesReady: false,
+      hasSession: false,
       message:
         'Konfigurasi VITE_SUPABASE_URL / ANON_KEY belum diisi. Berjalan di Mode Offline-Fallback.',
     };
@@ -219,6 +239,8 @@ export async function testSupabaseConnection(): Promise<{
     if (!healthRes.ok) {
       return {
         ok: false,
+        tablesReady: false,
+        hasSession: false,
         message: `Supabase URL atau Anon Public Key ditolak server (HTTP ${healthRes.status}). Periksa kembali kunci proyek Supabase Anda.`,
       };
     }
@@ -230,6 +252,9 @@ export async function testSupabaseConnection(): Promise<{
           ? 'konfigurasi server permanen (aktif di semua browser)'
           : 'konfigurasi browser lokal';
 
+    const { data: sessionData } = await client.auth.getSession();
+    const hasSession = Boolean(sessionData.session);
+
     const { error } = await client.from('school_settings').select('id').limit(1);
     if (error) {
       const msgLower = error.message.toLowerCase();
@@ -240,21 +265,31 @@ export async function testSupabaseConnection(): Promise<{
       ) {
         return {
           ok: true,
-          message: `Terhubung otomatis ke Supabase (${sourceText}) · Autentikasi & RLS aktif.`,
+          tablesReady: !hasSession,
+          hasSession,
+          message: hasSession
+            ? `Terhubung ke Supabase (${sourceText}), tetapi izin baca tabel ditolak (${error.message}). Pastikan skrip SQL terbaru (termasuk GRANT & RLS Policy) sudah dijalankan di Supabase SQL Editor.`
+            : `URL & Anon Key Supabase terhubung (${sourceText}). Tabel diproteksi RLS — silakan jalankan skrip SQL di Supabase SQL Editor dan masuk memakai akun yang terdaftar di Supabase Authentication agar sinkronisasi database berjalan.`,
         };
       }
       return {
         ok: false,
-        message: `Terkoneksi ke proyek Supabase, tetapi tabel belum siap: ${error.message}`,
+        tablesReady: false,
+        hasSession,
+        message: `Terkoneksi ke proyek Supabase (${sourceText}), tetapi tabel belum siap: ${error.message}. Salin dan jalankan skrip SQL di Supabase SQL Editor.`,
       };
     }
     return {
       ok: true,
-      message: `Terhubung otomatis ke Supabase (${sourceText}).`,
+      tablesReady: true,
+      hasSession,
+      message: `Terhubung penuh ke Supabase (${sourceText}) dan tabel siap disinkronkan.`,
     };
   } catch (err) {
     return {
       ok: false,
+      tablesReady: false,
+      hasSession: false,
       message: err instanceof Error ? err.message : 'Gagal menghubungi server Supabase.',
     };
   }

@@ -10,6 +10,7 @@ import {
 } from '../lib/realtimeNotifications';
 import {
   clearServerSupabaseConfigRemote,
+  createEphemeralSupabaseClient,
   getSupabaseClient,
   getSupabaseConfig,
   loadServerSupabaseConfig,
@@ -45,6 +46,16 @@ const STORAGE_KEY = 'pasundan9_eraport_state_v4';
 const LEGACY_STORAGE_KEY = 'pasundan9_eraport_state_v3';
 const NOTIF_STORAGE_KEY = 'pasundan9_eraport_notifications_v1';
 const READ_NOTIF_IDS_KEY = 'pasundan9_eraport_read_notif_ids_v1';
+const AUTH_TOKEN_KEY = 'pasundan9_auth_token_v1';
+
+function loadStoredAuthToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage.getItem(AUTH_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
 
 function loadStoredNotifications(): GradeNotification[] {
   if (typeof window === 'undefined') return [];
@@ -179,6 +190,7 @@ interface AppContextValue {
   lastSavedAt: string;
   supabaseMessage: string;
   supabaseConfigSource: SupabaseConfigSource;
+  supabaseSessionActive: boolean;
   settings: SchoolSettings;
   users: AuthUserSummary[];
   classes: ClassRoom[];
@@ -188,7 +200,11 @@ interface AppContextValue {
   homeroomRecords: HomeroomRecord[];
   gradeSubmissions: GradeSubmission[];
   // Auth & User Management
-  loginWithEmailPassword: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
+  loginWithEmailPassword: (
+    email: string,
+    password: string,
+    expectedRole?: UserRole
+  ) => Promise<{ ok: boolean; error?: string }>;
   registerTeacherAccount: (payload: {
     email: string;
     fullName: string;
@@ -215,7 +231,7 @@ interface AppContextValue {
     role: UserRole;
     password: string;
     assignedClassId?: string;
-  }) => Promise<{ ok: boolean; error?: string }>;
+  }) => Promise<{ ok: boolean; error?: string; warning?: string }>;
   updateUserAccount: (
     userId: string,
     patch: {
@@ -244,6 +260,7 @@ interface AppContextValue {
   unlockGrades: (classId: string, subjectId: string) => void;
   sendGradesToHomeroom: (classId: string, subjectId: string, note?: string) => void;
   syncFromSupabase: () => Promise<{ ok: boolean; message: string }>;
+  pushLocalDataToSupabase: () => Promise<{ ok: boolean; message: string }>;
   configureSupabase: (url: string, anonKey: string) => Promise<{ ok: boolean; message: string }>;
   disconnectSupabase: () => Promise<void>;
   // Realtime Notifications for Wali Kelas
@@ -263,7 +280,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const initial = useMemo(() => loadInitialState(), []);
 
   const [currentUser, setCurrentUser] = useState<AuthUserSummary | null>(null);
-  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [authToken, setAuthTokenState] = useState<string | null>(loadStoredAuthToken);
+  const setAuthToken = (token: string | null) => {
+    setAuthTokenState(token);
+    if (typeof window !== 'undefined') {
+      try {
+        if (token) {
+          window.sessionStorage.setItem(AUTH_TOKEN_KEY, token);
+        } else {
+          window.sessionStorage.removeItem(AUTH_TOKEN_KEY);
+        }
+      } catch {
+        // ignore storage quota
+      }
+    }
+  };
   const [authStatus, setAuthStatus] = useState<AuthSystemStatus>({
     adminClaimed: false,
     envPasscodeConfigured: false,
@@ -333,6 +364,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [supabaseConfigSource, setSupabaseConfigSource] = useState<SupabaseConfigSource>(
     () => getSupabaseConfig().source
   );
+  const [supabaseSessionActive, setSupabaseSessionActive] = useState<boolean>(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('saved_local');
   const [supabaseMessage, setSupabaseMessage] = useState<string>(
     'Mode Offline-Fallback aktif — auto-save lokal berjalan otomatis.'
@@ -575,10 +607,46 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const syncFromSupabase = async () => {
     const result = await syncFromSupabaseInternal();
     if (result.ok) {
+      setConnectionMode('supabase');
       setSyncStatus('connected');
+      setSupabaseMessage(result.message);
+    } else {
+      setSyncStatus('error');
       setSupabaseMessage(result.message);
     }
     return { ok: result.ok, message: result.message };
+  };
+
+  const pushLocalDataToSupabase = async (): Promise<{ ok: boolean; message: string }> => {
+    const client = getSupabaseClient();
+    if (!client) {
+      return { ok: false, message: 'Konfigurasi URL & Anon Key Supabase belum diisi.' };
+    }
+    if (!currentUser) {
+      return { ok: false, message: 'Silakan masuk terlebih dahulu sebelum menyinkronkan data.' };
+    }
+    setSyncStatus('syncing');
+    const res = await syncSchoolDataToSupabase(client, {
+      role: currentUser.role,
+      settings,
+      classes,
+      subjects,
+      students,
+      grades,
+      homeroomRecords,
+      gradeSubmissions,
+    });
+    if (res.ok) {
+      setConnectionMode('supabase');
+      setSyncStatus('connected');
+      const msg = `Data sekolah berhasil disinkronkan ke Supabase (${classes.length} kelas, ${subjects.length} mapel, ${students.length} siswa).`;
+      setSupabaseMessage(msg);
+      return { ok: true, message: msg };
+    }
+    const errMsg = res.error || 'Gagal menyinkronkan data ke Supabase.';
+    setSyncStatus('error');
+    setSupabaseMessage(errMsg);
+    return { ok: false, message: errMsg };
   };
 
   // Keep focusedClassId and focusedSubjectId valid whenever classes/subjects load from Supabase
@@ -602,19 +670,45 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     refreshAuthStatus();
 
+    const restoreExpressSession = async () => {
+      const storedToken = loadStoredAuthToken();
+      if (!storedToken) return false;
+      try {
+        const res = await fetch('/api/auth/me', {
+          headers: { Authorization: `Bearer ${storedToken}` },
+        });
+        if (!res.ok) {
+          setAuthToken(null);
+          return false;
+        }
+        const data = (await res.json()) as { user?: AuthUserSummary };
+        if (data.user) {
+          await loadSchoolStateFromServer(storedToken, data.user.role);
+          await fetchAuthorizedUsers(storedToken);
+          setCurrentUser((prev) => prev || data.user!);
+          return true;
+        }
+      } catch {
+        // ignore if /api is unreachable
+      }
+      return false;
+    };
+
     const initSupabase = async () => {
+      await restoreExpressSession();
       const cfg = await loadServerSupabaseConfig();
       setSupabaseConfigSource(cfg.source);
 
       if (cfg.url && cfg.anonKey) {
         const res = await testSupabaseConnection();
+        setSupabaseSessionActive(Boolean(res.hasSession));
         if (res.ok) {
           setConnectionMode('supabase');
-          setSyncStatus('connected');
+          setSyncStatus(res.tablesReady && res.hasSession ? 'connected' : res.hasSession ? 'error' : 'connected');
           setSupabaseMessage(res.message);
         } else {
-          setConnectionMode('offline');
-          setSyncStatus('saved_local');
+          setConnectionMode(cfg.url && cfg.anonKey ? 'supabase' : 'offline');
+          setSyncStatus('error');
           setSupabaseMessage(res.message);
         }
 
@@ -622,6 +716,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (client) {
           const { data } = await client.auth.getSession();
           const authUser = data.session?.user;
+          setSupabaseSessionActive(Boolean(authUser));
           if (authUser) {
             const { data: profile } = await client
               .from('profiles')
@@ -630,6 +725,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               .maybeSingle();
 
             const sbSync = await syncFromSupabaseInternal();
+            if (!sbSync.ok) {
+              setSyncStatus('error');
+              setSupabaseMessage(sbSync.message);
+            }
 
             if (profile) {
               const mapped: AuthUserSummary = {
@@ -645,7 +744,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               setCurrentUser(mapped);
               applyAuthenticatedFocus(mapped, sbSync.subjects, sbSync.classes);
             }
-          } else if (res.ok) {
+          } else if (res.ok && res.tablesReady) {
             await syncFromSupabaseInternal().catch(() => {});
           }
         }
@@ -878,7 +977,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
         const client = getSupabaseClient();
         if (client && connectionMode === 'supabase' && currentUser && !shouldSkipRemoteSync) {
-          await syncSchoolDataToSupabase(client, {
+          const sbPush = await syncSchoolDataToSupabase(client, {
             role: currentUser.role,
             settings,
             classes,
@@ -888,7 +987,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             homeroomRecords,
             gradeSubmissions,
           });
-          setSyncStatus('connected');
+          if (sbPush.ok) {
+            setSyncStatus('connected');
+          } else {
+            setSyncStatus('error');
+            if (sbPush.error) setSupabaseMessage(sbPush.error);
+          }
         } else if (client && connectionMode === 'supabase') {
           setSyncStatus('connected');
         } else {
@@ -1201,8 +1305,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const loginWithEmailPassword = async (
     email: string,
-    password: string
+    password: string,
+    expectedRole?: UserRole
   ): Promise<{ ok: boolean; error?: string }> => {
+    const roleLabels: Record<UserRole, string> = {
+      admin: 'Admin / Operator',
+      guru: 'Guru Mata Pelajaran',
+      wali_kelas: 'Wali Kelas',
+    };
     const client = getSupabaseClient();
     let supabaseErrorMessage = '';
 
@@ -1215,78 +1325,145 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             meta.role === 'wali_kelas' ? 'wali_kelas' : 'guru';
 
           let activeProfile: Record<string, unknown> | null = null;
+          let profileQueryError: string | null = null;
           try {
-            const { data: profile } = await client
+            const { data: profile, error: profErr } = await client
               .from('profiles')
               .select('*')
               .eq('id', data.user.id)
               .maybeSingle();
-            activeProfile = (profile as Record<string, unknown> | null) || null;
-
-            if (!activeProfile) {
-              const fullName =
-                typeof meta.full_name === 'string' && meta.full_name.trim()
-                  ? meta.full_name.trim()
-                  : email.split('@')[0];
-              const nipNuptk =
-                typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk.trim() : '';
-              const { data: inserted } = await client
-                .from('profiles')
-                .upsert(
-                  {
-                    id: data.user.id,
-                    email: data.user.email || email.trim().toLowerCase(),
-                    full_name: fullName,
-                    nip_nuptk: nipNuptk,
-                    role: safeMetaRole,
-                  },
-                  { onConflict: 'id' }
-                )
-                .select('*')
-                .maybeSingle();
-              activeProfile = (inserted as Record<string, unknown> | null) || null;
+            if (profErr) {
+              profileQueryError = profErr.message;
+            } else {
+              activeProfile = (profile as Record<string, unknown> | null) || null;
             }
-          } catch {
-            // Keep login succeeding with auth metadata if profiles table isn't ready
+          } catch (err) {
+            profileQueryError = err instanceof Error ? err.message : 'Gagal membaca profil.';
           }
 
-          const profileRole = activeProfile?.role;
-          const resolvedRole: UserRole =
-            profileRole === 'admin' || profileRole === 'wali_kelas' || profileRole === 'guru'
-              ? profileRole
-              : safeMetaRole;
+          let serverVerifiedAuth: { token: string; user: AuthUserSummary } | null = null;
+          const profileRoleRaw = activeProfile?.role;
 
-          const mapped: AuthUserSummary = {
-            id: data.user.id,
-            email:
-              (typeof activeProfile?.email === 'string' && activeProfile.email) ||
-              data.user.email ||
-              email.trim().toLowerCase(),
-            fullName:
-              (typeof activeProfile?.full_name === 'string' && activeProfile.full_name) ||
-              (typeof meta.full_name === 'string' && meta.full_name.trim()) ||
-              email.split('@')[0],
-            nipNuptk:
-              (typeof activeProfile?.nip_nuptk === 'string' && activeProfile.nip_nuptk) ||
-              (typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk : ''),
-            nrks: typeof activeProfile?.nrks === 'string' ? activeProfile.nrks : '',
-            role: resolvedRole,
-            avatarUrl:
-              typeof activeProfile?.avatar_url === 'string'
-                ? activeProfile.avatar_url
-                : undefined,
-            assignedClassId:
-              typeof meta.assigned_class_id === 'string'
-                ? meta.assigned_class_id
-                : undefined,
-            isActive: true,
-          };
+          try {
+            const srvRes = await fetch('/api/auth/login', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, password }),
+            });
+            const srvParsed = await safeParseAuthResponse<{
+              token?: string;
+              user?: AuthUserSummary;
+            }>(srvRes);
+            if (srvParsed.ok && srvParsed.data?.token && srvParsed.data?.user) {
+              serverVerifiedAuth = {
+                token: srvParsed.data.token,
+                user: srvParsed.data.user,
+              };
+            }
+          } catch {
+            // ignore if backend /api is unavailable
+          }
+
+          if (profileRoleRaw && serverVerifiedAuth && profileRoleRaw === 'admin') {
+            serverVerifiedAuth.user = {
+              ...serverVerifiedAuth.user,
+              role: 'admin',
+            };
+          }
+
+          if (!serverVerifiedAuth && !activeProfile) {
+            await client.auth.signOut().catch(() => {});
+            if (profileQueryError && expectedRole === 'admin') {
+              return {
+                ok: false,
+                error: `Tabel profiles di Supabase belum siap (${profileQueryError}). Jalankan skrip SQL di Supabase SQL Editor lalu pastikan role akun di tabel profiles adalah 'admin'.`,
+              };
+            }
+            return {
+              ok: false,
+              error:
+                'Akun ini belum didaftarkan oleh Admin Sekolah. Hanya Admin yang dapat mendaftarkan akun baru.',
+            };
+          }
+
+          const finalProfileRole = activeProfile?.role;
+          const resolvedRole: UserRole =
+            serverVerifiedAuth?.user.role ||
+            (finalProfileRole === 'admin' ||
+            finalProfileRole === 'wali_kelas' ||
+            finalProfileRole === 'guru'
+              ? finalProfileRole
+              : safeMetaRole);
+
+          if (expectedRole && resolvedRole !== expectedRole) {
+            await client.auth.signOut().catch(() => {});
+            return {
+              ok: false,
+              error: `Akun ini terdaftar sebagai ${roleLabels[resolvedRole]}, bukan ${roleLabels[expectedRole]}. Silakan pilih role "${roleLabels[resolvedRole]}".`,
+            };
+          }
+
+          const mapped: AuthUserSummary = serverVerifiedAuth
+            ? {
+                ...serverVerifiedAuth.user,
+                id: activeProfile?.id ? String(activeProfile.id) : serverVerifiedAuth.user.id,
+              }
+            : {
+                id: data.user.id,
+                email:
+                  (typeof activeProfile?.email === 'string' && activeProfile.email) ||
+                  data.user.email ||
+                  email.trim().toLowerCase(),
+                fullName:
+                  (typeof activeProfile?.full_name === 'string' && activeProfile.full_name) ||
+                  (typeof meta.full_name === 'string' && meta.full_name.trim()) ||
+                  email.split('@')[0],
+                nipNuptk:
+                  (typeof activeProfile?.nip_nuptk === 'string' && activeProfile.nip_nuptk) ||
+                  (typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk : ''),
+                nrks: typeof activeProfile?.nrks === 'string' ? activeProfile.nrks : '',
+                role: resolvedRole,
+                avatarUrl:
+                  typeof activeProfile?.avatar_url === 'string'
+                    ? activeProfile.avatar_url
+                    : undefined,
+                assignedClassId:
+                  typeof meta.assigned_class_id === 'string'
+                    ? meta.assigned_class_id
+                    : undefined,
+                isActive: true,
+              };
+
+          if (serverVerifiedAuth) {
+            setAuthToken(serverVerifiedAuth.token);
+            await loadSchoolStateFromServer(serverVerifiedAuth.token, mapped.role);
+            await fetchAuthorizedUsers(serverVerifiedAuth.token);
+          }
 
           setCurrentUser(mapped);
+          setSupabaseSessionActive(true);
           setConnectionMode('supabase');
-          setSyncStatus('connected');
           const sbSync = await syncFromSupabaseInternal();
-          applyAuthenticatedFocus(mapped, sbSync.subjects, sbSync.classes);
+          if (sbSync.ok) {
+            if (mapped.role === 'admin' && activeProfile?.role !== 'admin') {
+              setSyncStatus('error');
+              setSupabaseMessage(
+                `Login Admin berhasil, namun profil Supabase (${mapped.email}) belum berstatus "admin". Jalankan skrip SQL di tab Database Supabase & SQL atau jalankan: UPDATE public.profiles SET role = 'admin' WHERE email = '${mapped.email}'; di Supabase SQL Editor.`
+              );
+            } else {
+              setSyncStatus('connected');
+              setSupabaseMessage(sbSync.message);
+            }
+          } else {
+            setSyncStatus('error');
+            setSupabaseMessage(sbSync.message);
+          }
+          applyAuthenticatedFocus(
+            mapped,
+            sbSync.ok && (sbSync.subjects?.length || 0) > 0 ? sbSync.subjects : undefined,
+            sbSync.ok && (sbSync.classes?.length || 0) > 0 ? sbSync.classes : undefined
+          );
           return { ok: true };
         }
         if (error) {
@@ -1303,7 +1480,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email, password, expectedRole }),
       });
       const parsed = await safeParseAuthResponse<{
         token?: string;
@@ -1317,14 +1494,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             return {
               ok: false,
               error:
-                'Email belum dikonfirmasi di Supabase. Cek inbox email Anda atau aktifkan Auto Confirm User di Supabase Authentication.',
+                'Email belum terkonfirmasi di Supabase Auth. Jalankan skrip SQL terbaru di tab Database Supabase & SQL atau nonaktifkan "Confirm email" di Supabase Authentication agar akun langsung aktif tanpa verifikasi email.',
             };
           }
           if (lower.includes('invalid login credentials') || !supabaseErrorMessage) {
             return {
               ok: false,
               error:
-                'Email atau kata sandi belum terdaftar di Supabase Auth (atau tidak cocok). Untuk Guru/Wali silakan daftar di tab "Daftar Guru / Wali"; untuk Admin pastikan akun sudah dibuat di Supabase Authentication → Users.',
+                'Email atau kata sandi salah, atau akun belum didaftarkan oleh Admin Sekolah.',
             };
           }
           return {
@@ -1342,13 +1519,61 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         };
       }
       const synced = await loadSchoolStateFromServer(data.token, data.user.role);
-      const sbSync = await syncFromSupabaseInternal();
+      let hasSbSession = false;
+      if (client) {
+        const { data: existingSession } = await client.auth.getSession();
+        hasSbSession = Boolean(existingSession.session);
+        if (!hasSbSession && supabaseErrorMessage.toLowerCase().includes('invalid login credentials')) {
+          try {
+            const { data: signUpData } = await client.auth.signUp({
+              email: email.trim().toLowerCase(),
+              password,
+              options: {
+                data: {
+                  full_name: data.user.fullName,
+                  nip_nuptk: data.user.nipNuptk || '',
+                  ...(data.user.role !== 'admin' ? { role: data.user.role } : {}),
+                },
+              },
+            });
+            hasSbSession = Boolean(signUpData.session);
+            if (!hasSbSession && signUpData.user) {
+              const { data: signInRetry } = await client.auth.signInWithPassword({
+                email: email.trim().toLowerCase(),
+                password,
+              });
+              hasSbSession = Boolean(signInRetry.session);
+            }
+          } catch {
+            // keep Express session active even if Supabase signUp fails
+          }
+        }
+      }
+      setSupabaseSessionActive(hasSbSession);
+
+      const sbSync = hasSbSession
+        ? await syncFromSupabaseInternal()
+        : { ok: false, message: '', subjects: undefined, classes: undefined };
+
       setAuthToken(data.token);
       setCurrentUser(data.user);
+      if (client && !hasSbSession) {
+        setSyncStatus('error');
+        setSupabaseMessage(
+          'Login berhasil melalui server sekolah, namun sesi Supabase Auth belum aktif (buat/konfirmasi akun ini di Supabase Authentication → Users dan jalankan skrip SQL di tab Database Supabase & SQL agar data tersinkron ke Supabase).'
+        );
+      } else if (hasSbSession && !sbSync.ok) {
+        setSyncStatus('error');
+        setSupabaseMessage(sbSync.message);
+      } else if (hasSbSession && sbSync.ok) {
+        setSyncStatus('connected');
+        setSupabaseMessage(sbSync.message);
+      }
+
       applyAuthenticatedFocus(
         data.user,
-        sbSync.ok ? sbSync.subjects : synced.subjects,
-        sbSync.ok ? sbSync.classes : synced.classes
+        sbSync.ok && (sbSync.classes?.length || 0) > 0 ? sbSync.subjects : synced.subjects,
+        sbSync.ok && (sbSync.classes?.length || 0) > 0 ? sbSync.classes : synced.classes
       );
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
@@ -1369,7 +1594,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const registerTeacherAccount = async (payload: {
+  const registerTeacherAccount = async (_payload: {
     email: string;
     fullName: string;
     nipNuptk?: string;
@@ -1377,121 +1602,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     assignedClassId?: string;
     password: string;
   }): Promise<{ ok: boolean; error?: string }> => {
-    const registerViaSupabase = async (): Promise<{ ok: boolean; error?: string } | null> => {
-      const client = getSupabaseClient();
-      if (!client) return null;
-      try {
-        const { data, error } = await client.auth.signUp({
-          email: payload.email.trim().toLowerCase(),
-          password: payload.password,
-          options: {
-            data: {
-              full_name: payload.fullName.trim(),
-              nip_nuptk: (payload.nipNuptk || '').trim(),
-              role: payload.role,
-              assigned_class_id: payload.assignedClassId || null,
-            },
-          },
-        });
-        if (error) {
-          return { ok: false, error: error.message };
-        }
-        if (!data.user) {
-          return { ok: false, error: 'Gagal membuat akun di Supabase.' };
-        }
-        if (!data.session) {
-          return {
-            ok: false,
-            error:
-              'Akun berhasil dibuat di Supabase! Silakan cek inbox email Anda untuk konfirmasi lalu masuk di tab "Masuk Akun".',
-          };
-        }
-
-        await client.from('profiles').upsert(
-          {
-            id: data.user.id,
-            email: payload.email.trim().toLowerCase(),
-            full_name: payload.fullName.trim(),
-            nip_nuptk: (payload.nipNuptk || '').trim(),
-            role: payload.role,
-          },
-          { onConflict: 'id' }
-        );
-
-        const registered: AuthUserSummary = {
-          id: data.user.id,
-          email: payload.email.trim().toLowerCase(),
-          fullName: payload.fullName.trim(),
-          nipNuptk: (payload.nipNuptk || '').trim(),
-          nrks: payload.role === 'wali_kelas' ? 'WK' : 'GR',
-          role: payload.role,
-          assignedClassId:
-            payload.role === 'wali_kelas' ? payload.assignedClassId : undefined,
-          isActive: true,
-        };
-        if (registered.role === 'wali_kelas' && registered.assignedClassId) {
-          setClasses((prev) =>
-            prev.map((c) =>
-              c.id === registered.assignedClassId
-                ? { ...c, homeroomTeacherId: registered.id }
-                : c
-            )
-          );
-        }
-        setCurrentUser(registered);
-        setConnectionMode('supabase');
-        setSyncStatus('connected');
-        const sbSync = await syncFromSupabaseInternal();
-        applyAuthenticatedFocus(registered, sbSync.subjects, sbSync.classes);
-        return { ok: true };
-      } catch {
-        return null;
-      }
+    return {
+      ok: false,
+      error:
+        'Pendaftaran mandiri dinonaktifkan. Hanya Admin Sekolah yang dapat mendaftarkan akun baru.',
     };
-
-    try {
-      const res = await fetch('/api/auth/register', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const parsed = await safeParseAuthResponse<{
-        token?: string;
-        user?: AuthUserSummary;
-        error?: string;
-      }>(res);
-      if (parsed.rawError) {
-        const sbResult = await registerViaSupabase();
-        if (sbResult) return sbResult;
-        return { ok: false, error: parsed.rawError };
-      }
-      const data = parsed.data || {};
-      if (!parsed.ok || !data.token || !data.user) {
-        return { ok: false, error: data.error || 'Gagal mendaftarkan akun guru.' };
-      }
-      const synced = await loadSchoolStateFromServer(data.token, data.user.role);
-      const registered = data.user;
-      if (registered.role === 'wali_kelas' && registered.assignedClassId) {
-        setClasses((prev) =>
-          prev.map((c) =>
-            c.id === registered.assignedClassId
-              ? { ...c, homeroomTeacherId: registered.id }
-              : c
-          )
-        );
-      }
-      setAuthToken(data.token);
-      setCurrentUser(registered);
-      applyAuthenticatedFocus(registered, synced.subjects, synced.classes);
-      await refreshAuthStatus();
-      await fetchAuthorizedUsers(data.token);
-      return { ok: true };
-    } catch {
-      const sbResult = await registerViaSupabase();
-      if (sbResult) return sbResult;
-      return { ok: false, error: 'Tidak dapat terhubung ke server pendaftaran.' };
-    }
   };
 
   const claimFirstAdmin = async (payload: {
@@ -1539,26 +1654,45 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     currentPassword: string,
     newPassword: string
   ): Promise<{ ok: boolean; error?: string }> => {
-    if (!authToken) {
+    if (authToken) {
+      try {
+        const res = await fetch('/api/auth/change-password', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify({ currentPassword, newPassword }),
+        });
+        const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
+        if (!parsed.rawError) {
+          const data = parsed.data || {};
+          if (!parsed.ok) {
+            return { ok: false, error: data.error || 'Gagal memperbarui kata sandi.' };
+          }
+          return { ok: true };
+        }
+      } catch {
+        // fall through to Supabase Auth password change if /api unreachable
+      }
+    }
+
+    const client = getSupabaseClient();
+    if (!client || !currentUser?.email) {
       return { ok: false, error: 'Sesi login tidak ditemukan.' };
     }
-    try {
-      const res = await fetch('/api/auth/change-password', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
-      const data = (await res.json()) as { ok?: boolean; error?: string };
-      if (!res.ok) {
-        return { ok: false, error: data.error || 'Gagal memperbarui kata sandi.' };
-      }
-      return { ok: true };
-    } catch {
-      return { ok: false, error: 'Gagal menghubungi server.' };
+    const { error: verifyErr } = await client.auth.signInWithPassword({
+      email: currentUser.email,
+      password: currentPassword,
+    });
+    if (verifyErr) {
+      return { ok: false, error: 'Kata sandi saat ini tidak sesuai.' };
     }
+    const { error: updateErr } = await client.auth.updateUser({ password: newPassword });
+    if (updateErr) {
+      return { ok: false, error: `Gagal memperbarui kata sandi: ${updateErr.message}` };
+    }
+    return { ok: true };
   };
 
   const createUserAccount = async (payload: {
@@ -1569,39 +1703,248 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     role: UserRole;
     password: string;
     assignedClassId?: string;
-  }): Promise<{ ok: boolean; error?: string }> => {
-    if (!authToken) {
-      return { ok: false, error: 'Sesi Admin tidak valid.' };
+  }): Promise<{ ok: boolean; error?: string; warning?: string }> => {
+    if (!currentUser || currentUser.role !== 'admin') {
+      return { ok: false, error: 'Hanya Admin Sekolah yang dapat membuat akun pengguna baru.' };
     }
-    try {
-      const res = await fetch('/api/users', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify(payload),
-      });
-      const data = (await res.json()) as { user?: AuthUserSummary; error?: string };
-      if (!res.ok || !data.user) {
-        return { ok: false, error: data.error || 'Gagal menambah akun pengguna.' };
+
+    const cleanEmail = payload.email.trim().toLowerCase();
+    const cleanName = payload.fullName.trim();
+    const cleanNip = (payload.nipNuptk || '').trim();
+    const cleanNrks = (payload.nrks || '').trim();
+
+    const syncNewUserToSupabase = async (): Promise<{
+      ok: boolean;
+      user?: AuthUserSummary;
+      autoConfirmed?: boolean;
+      error?: string;
+    }> => {
+      const mainClient = getSupabaseClient();
+      const ephemeralClient = createEphemeralSupabaseClient();
+      if (!mainClient || !ephemeralClient) {
+        return { ok: false, error: 'Koneksi Supabase belum terkonfigurasi.' };
       }
-      const createdUser = data.user;
-      setUsers((prev) => [...prev, createdUser]);
-      if (createdUser.role === 'wali_kelas' && createdUser.assignedClassId) {
-        setClasses((prev) =>
-          prev.map((c) =>
-            c.id === createdUser.assignedClassId
-              ? { ...c, homeroomTeacherId: createdUser.id }
-              : c
-          )
+
+      const { data: sessionCheck } = await mainClient.auth.getSession();
+      if (!sessionCheck.session) {
+        return {
+          ok: false,
+          error:
+            'Sesi Supabase Auth Admin belum aktif. Keluar lalu masuk kembali menggunakan akun Admin agar pembuatan akun tersinkron ke Supabase.',
+        };
+      }
+
+      // 1. Prioritaskan RPC admin_create_user (bekerja langsung aktif tanpa verifikasi email
+      //    meskipun "Allow new users to sign up" dimatikan di Supabase Auth)
+      try {
+        const { data: rpcUserId, error: rpcErr } = await mainClient.rpc('admin_create_user', {
+          p_email: cleanEmail,
+          p_password: payload.password,
+          p_full_name: cleanName,
+          p_nip_nuptk: cleanNip,
+          p_nrks: cleanNrks,
+          p_role: payload.role,
+          p_assigned_class_id:
+            payload.role === 'wali_kelas' ? payload.assignedClassId || null : null,
+        });
+
+        if (!rpcErr && typeof rpcUserId === 'string' && rpcUserId.length > 0) {
+          return {
+            ok: true,
+            autoConfirmed: true,
+            user: {
+              id: rpcUserId,
+              email: cleanEmail,
+              fullName: cleanName,
+              nipNuptk: cleanNip,
+              nrks: cleanNrks,
+              role: payload.role,
+              assignedClassId:
+                payload.role === 'wali_kelas' ? payload.assignedClassId : undefined,
+              isActive: true,
+              hasPassword: true,
+            },
+          };
+        }
+
+        if (rpcErr) {
+          const msg = rpcErr.message.toLowerCase();
+          const code = rpcErr.code || '';
+          const missingOrNoPriv =
+            code === '42883' ||
+            code === 'PGRST202' ||
+            code === '42501' ||
+            msg.includes('could not find the function') ||
+            msg.includes('does not exist') ||
+            msg.includes('permission denied');
+          if (!missingOrNoPriv) {
+            return { ok: false, error: rpcErr.message };
+          }
+        }
+      } catch {
+        // Fall through to ephemeralClient.auth.signUp when RPC is not yet installed
+      }
+
+      const { data: signUpData, error: signUpErr } = await ephemeralClient.auth.signUp({
+        email: cleanEmail,
+        password: payload.password,
+        options: {
+          data: {
+            full_name: cleanName,
+            nip_nuptk: cleanNip,
+            ...(payload.role !== 'admin' ? { role: payload.role } : {}),
+            assigned_class_id: payload.assignedClassId || null,
+          },
+        },
+      });
+
+      if (signUpErr) {
+        const lower = signUpErr.message.toLowerCase();
+        if (lower.includes('already registered') || lower.includes('already exists')) {
+          return { ok: false, error: 'Email tersebut sudah terdaftar di Supabase Authentication.' };
+        }
+        if (lower.includes('signups are disabled') || lower.includes('signups not allowed')) {
+          return {
+            ok: false,
+            error:
+              'Gagal mendaftarkan ke Supabase Auth karena "Allow new users to sign up" dimatikan (Email signups are disabled). Jalankan skrip SQL terbaru dari tab Database Supabase & SQL di Supabase SQL Editor agar Admin bisa mendaftarkan akun via fungsi admin_create_user tanpa membuka pendaftaran publik, atau aktifkan "Allow new users to sign up" di Supabase Dashboard → Authentication → Providers → Email.',
+          };
+        }
+        return { ok: false, error: `Gagal mendaftarkan ke Supabase Auth: ${signUpErr.message}` };
+      }
+
+      if (!signUpData.user) {
+        return { ok: false, error: 'Gagal membuat akun di Supabase Auth.' };
+      }
+
+      const { error: profErr } = await mainClient.from('profiles').upsert(
+        {
+          id: signUpData.user.id,
+          email: cleanEmail,
+          full_name: cleanName,
+          nip_nuptk: cleanNip,
+          nrks: cleanNrks,
+          role: payload.role,
+        },
+        { onConflict: 'id' }
+      );
+      if (profErr) {
+        await ephemeralClient.auth.signOut().catch(() => {});
+        return {
+          ok: false,
+          error: `Akun Auth dibuat, namun gagal menyimpan profil role di Supabase (${profErr.message}).`,
+        };
+      }
+
+      let autoConfirmed = Boolean(signUpData.session);
+      if (!autoConfirmed) {
+        const { data: confirmCheck } = await ephemeralClient.auth.signInWithPassword({
+          email: cleanEmail,
+          password: payload.password,
+        });
+        autoConfirmed = Boolean(confirmCheck.session);
+      }
+      await ephemeralClient.auth.signOut().catch(() => {});
+
+      return {
+        ok: true,
+        autoConfirmed,
+        user: {
+          id: signUpData.user.id,
+          email: cleanEmail,
+          fullName: cleanName,
+          nipNuptk: cleanNip,
+          nrks: cleanNrks,
+          role: payload.role,
+          assignedClassId: payload.role === 'wali_kelas' ? payload.assignedClassId : undefined,
+          isActive: true,
+          hasPassword: true,
+        },
+      };
+    };
+
+    if (authToken) {
+      try {
+        const res = await fetch('/api/users', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify(payload),
+        });
+        const parsed = await safeParseAuthResponse<{
+          user?: AuthUserSummary;
+          supabaseConfirmed?: boolean;
+          error?: string;
+        }>(res);
+        if (!parsed.rawError) {
+          const data = parsed.data || {};
+          if (!parsed.ok || !data.user) {
+            return { ok: false, error: data.error || 'Gagal menambah akun pengguna.' };
+          }
+          const createdUser = data.user;
+          let warning: string | undefined;
+          if (!data.supabaseConfirmed) {
+            const sbMirror = await syncNewUserToSupabase().catch(() => null);
+            if (sbMirror && !sbMirror.ok && sbMirror.error) {
+              warning = `Akun aktif di Server Sekolah, namun sinkronisasi ke Supabase Auth gagal: ${sbMirror.error}`;
+            } else if (sbMirror && sbMirror.ok && sbMirror.autoConfirmed === false) {
+              warning =
+                'Akun langsung aktif di Server Sekolah tanpa verifikasi email. Agar login Supabase di perangkat luar juga tanpa verifikasi email, jalankan SQL terbaru di tab Database Supabase & SQL atau nonaktifkan "Confirm email" di Supabase Dashboard.';
+            }
+          }
+          setUsers((prev) => [...prev, createdUser]);
+          if (createdUser.role === 'wali_kelas' && createdUser.assignedClassId) {
+            setClasses((prev) =>
+              prev.map((c) =>
+                c.id === createdUser.assignedClassId
+                  ? { ...c, homeroomTeacherId: createdUser.id }
+                  : c
+              )
+            );
+          }
+          await refreshAuthStatus();
+          return { ok: true, warning };
+        }
+      } catch {
+        // fall through to direct Supabase mode if /api is unreachable
+      }
+    }
+
+    const sbCreated = await syncNewUserToSupabase();
+    if (!sbCreated.ok || !sbCreated.user) {
+      return {
+        ok: false,
+        error: sbCreated.error || 'Sesi Admin tidak valid. Silakan keluar dan masuk kembali.',
+      };
+    }
+
+    const createdUser = sbCreated.user;
+    setUsers((prev) => {
+      if (prev.some((u) => u.email.toLowerCase() === createdUser.email.toLowerCase())) {
+        return prev.map((u) =>
+          u.email.toLowerCase() === createdUser.email.toLowerCase() ? createdUser : u
         );
       }
-      await refreshAuthStatus();
-      return { ok: true };
-    } catch {
-      return { ok: false, error: 'Gagal menghubungi server.' };
+      return [...prev, createdUser];
+    });
+    if (createdUser.role === 'wali_kelas' && createdUser.assignedClassId) {
+      setClasses((prev) =>
+        prev.map((c) =>
+          c.id === createdUser.assignedClassId
+            ? { ...c, homeroomTeacherId: createdUser.id }
+            : c
+        )
+      );
     }
+    return {
+      ok: true,
+      warning:
+        sbCreated.autoConfirmed === false
+          ? 'Akun tersimpan di Supabase, tetapi pengaturan "Confirm email" Supabase masih aktif. Jalankan SQL terbaru di tab Database Supabase & SQL atau matikan "Confirm email" di Supabase Dashboard -> Authentication -> Providers -> Email agar langsung aktif tanpa verifikasi email.'
+          : undefined,
+    };
   };
 
   const updateUserAccount = async (
@@ -1616,62 +1959,135 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       newPassword?: string;
     }
   ): Promise<{ ok: boolean; error?: string }> => {
-    if (!authToken) {
-      return { ok: false, error: 'Sesi Admin tidak valid.' };
+    if (!currentUser || currentUser.role !== 'admin') {
+      return { ok: false, error: 'Hanya Admin Sekolah yang dapat memperbarui akun.' };
     }
-    try {
-      const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify(patch),
-      });
-      const data = (await res.json()) as { user?: AuthUserSummary; error?: string };
-      if (!res.ok || !data.user) {
-        return { ok: false, error: data.error || 'Gagal memperbarui akun.' };
+
+    if (authToken) {
+      try {
+        const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify(patch),
+        });
+        const parsed = await safeParseAuthResponse<{ user?: AuthUserSummary; error?: string }>(res);
+        if (!parsed.rawError) {
+          const data = parsed.data || {};
+          if (!parsed.ok || !data.user) {
+            return { ok: false, error: data.error || 'Gagal memperbarui akun.' };
+          }
+          const updatedUser = data.user;
+          setUsers((prev) => prev.map((u) => (u.id === userId ? updatedUser : u)));
+          if (currentUser?.id === userId) {
+            setCurrentUser(updatedUser);
+          }
+          if (updatedUser.role === 'wali_kelas' && updatedUser.assignedClassId) {
+            setClasses((prev) =>
+              prev.map((c) =>
+                c.id === updatedUser.assignedClassId
+                  ? { ...c, homeroomTeacherId: updatedUser.id }
+                  : c
+              )
+            );
+          }
+          await refreshAuthStatus();
+          return { ok: true };
+        }
+      } catch {
+        // fall through to Supabase update if /api is unreachable
       }
-      const updatedUser = data.user;
-      setUsers((prev) => prev.map((u) => (u.id === userId ? updatedUser : u)));
-      if (currentUser?.id === userId) {
-        setCurrentUser(updatedUser);
-      }
-      if (updatedUser.role === 'wali_kelas' && updatedUser.assignedClassId) {
-        setClasses((prev) =>
-          prev.map((c) =>
-            c.id === updatedUser.assignedClassId
-              ? { ...c, homeroomTeacherId: updatedUser.id }
-              : c
-          )
-        );
-      }
-      await refreshAuthStatus();
-      return { ok: true };
-    } catch {
-      return { ok: false, error: 'Gagal menghubungi server.' };
     }
+
+    const client = getSupabaseClient();
+    if (!client) {
+      return { ok: false, error: 'Sesi server tidak tersedia dan Supabase belum dikonfigurasi.' };
+    }
+    if (patch.newPassword) {
+      return {
+        ok: false,
+        error:
+          'Reset kata sandi langsung memerlukan koneksi server (/api) aktif atau dilakukan melalui Supabase Dashboard → Authentication → Users.',
+      };
+    }
+
+    const target = users.find((u) => u.id === userId);
+    const updatePayload: Record<string, unknown> = {};
+    if (patch.fullName !== undefined) updatePayload.full_name = patch.fullName.trim();
+    if (patch.nipNuptk !== undefined) updatePayload.nip_nuptk = patch.nipNuptk.trim();
+    if (patch.nrks !== undefined) updatePayload.nrks = patch.nrks.trim();
+    if (patch.role !== undefined) updatePayload.role = patch.role;
+
+    const { error } = await client
+      .from('profiles')
+      .update(updatePayload)
+      .eq('id', userId);
+    if (error) {
+      return { ok: false, error: `Gagal memperbarui profil di Supabase: ${error.message}` };
+    }
+
+    const updatedUser: AuthUserSummary = {
+      ...(target || {
+        id: userId,
+        email: '',
+        fullName: patch.fullName || '',
+        nipNuptk: '',
+        role: patch.role || 'guru',
+      }),
+      ...(patch.fullName !== undefined ? { fullName: patch.fullName.trim() } : {}),
+      ...(patch.nipNuptk !== undefined ? { nipNuptk: patch.nipNuptk.trim() } : {}),
+      ...(patch.nrks !== undefined ? { nrks: patch.nrks.trim() } : {}),
+      ...(patch.role !== undefined ? { role: patch.role } : {}),
+      ...(patch.isActive !== undefined ? { isActive: patch.isActive } : {}),
+      ...(patch.assignedClassId !== undefined
+        ? { assignedClassId: patch.assignedClassId || undefined }
+        : {}),
+    };
+    setUsers((prev) => prev.map((u) => (u.id === userId ? updatedUser : u)));
+    if (currentUser?.id === userId) {
+      setCurrentUser(updatedUser);
+    }
+    return { ok: true };
   };
 
   const deleteUserAccount = async (userId: string): Promise<{ ok: boolean; error?: string }> => {
-    if (!authToken) {
-      return { ok: false, error: 'Sesi Admin tidak valid.' };
+    if (!currentUser || currentUser.role !== 'admin') {
+      return { ok: false, error: 'Hanya Admin Sekolah yang dapat menghapus akun.' };
     }
-    try {
-      const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${authToken}` },
-      });
-      const data = (await res.json()) as { ok?: boolean; error?: string };
-      if (!res.ok) {
-        return { ok: false, error: data.error || 'Gagal menghapus akun.' };
+
+    if (authToken) {
+      try {
+        const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
+        if (!parsed.rawError) {
+          const data = parsed.data || {};
+          if (!parsed.ok) {
+            return { ok: false, error: data.error || 'Gagal menghapus akun.' };
+          }
+          setUsers((prev) => prev.filter((u) => u.id !== userId));
+          await refreshAuthStatus();
+          return { ok: true };
+        }
+      } catch {
+        // fall through to Supabase profile delete if /api is unreachable
       }
-      setUsers((prev) => prev.filter((u) => u.id !== userId));
-      await refreshAuthStatus();
-      return { ok: true };
-    } catch {
-      return { ok: false, error: 'Gagal menghubungi server.' };
     }
+
+    const client = getSupabaseClient();
+    if (!client) {
+      return { ok: false, error: 'Sesi server tidak tersedia dan Supabase belum dikonfigurasi.' };
+    }
+    const { error } = await client.from('profiles').delete().eq('id', userId);
+    if (error) {
+      return { ok: false, error: `Gagal menghapus profil di Supabase: ${error.message}` };
+    }
+    setUsers((prev) => prev.filter((u) => u.id !== userId));
+    return { ok: true };
   };
 
   const logout = async () => {
@@ -1679,6 +2095,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (client) {
       await client.auth.signOut().catch(() => {});
     }
+    setSupabaseSessionActive(false);
     setAuthToken(null);
     setCurrentUser(null);
   };
@@ -1692,6 +2109,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setSupabaseConfigSource(activeCfg.source);
 
     const res = await testSupabaseConnection();
+    setSupabaseSessionActive(Boolean(res.hasSession));
     let finalMsg = res.message;
     if (res.ok && remoteSave.ok) {
       finalMsg = `${res.message} Tersimpan permanen di server — otomatis aktif saat dibuka di browser atau perangkat lain.`;
@@ -1701,11 +2119,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     if (res.ok) {
       setConnectionMode('supabase');
-      setSyncStatus('connected');
-      await syncFromSupabaseInternal().catch(() => {});
+      setSyncStatus(res.hasSession && res.tablesReady ? 'connected' : 'error');
+      if (res.hasSession) {
+        await syncFromSupabaseInternal().catch(() => {});
+      }
     } else {
-      setConnectionMode('offline');
-      setSyncStatus('saved_local');
+      setConnectionMode(activeCfg.url && activeCfg.anonKey ? 'supabase' : 'offline');
+      setSyncStatus('error');
     }
     setSupabaseMessage(finalMsg);
     return { ok: res.ok, message: finalMsg };
@@ -1713,6 +2133,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const disconnectSupabase = async () => {
     await clearServerSupabaseConfigRemote(authToken);
+    setSupabaseSessionActive(false);
     const activeCfg = getSupabaseConfig();
     setSupabaseConfigSource(activeCfg.source);
     if (activeCfg.url && activeCfg.anonKey) {
@@ -1804,6 +2225,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         lastSavedAt,
         supabaseMessage,
         supabaseConfigSource,
+        supabaseSessionActive,
         settings,
         users,
         classes,
@@ -1833,6 +2255,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         unlockGrades,
         sendGradesToHomeroom,
         syncFromSupabase,
+        pushLocalDataToSupabase,
         configureSupabase,
         disconnectSupabase,
         notifications: visibleNotifications,

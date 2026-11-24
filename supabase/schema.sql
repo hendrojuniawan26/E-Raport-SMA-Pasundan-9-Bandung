@@ -4,9 +4,14 @@
 -- SMA PASUNDAN 9 BANDUNG
 -- ============================================================================
 
--- Ekstensi UUID opsional (Primary key menggunakan gen_random_uuid() bawaan PostgreSQL)
+-- Ekstensi UUID & kriptografi (untuk fungsi admin_create_user)
 DO $$ BEGIN
   CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+EXCEPTION WHEN OTHERS THEN null;
+END $$;
+
+DO $$ BEGIN
+  CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA extensions;
 EXCEPTION WHEN OTHERS THEN null;
 END $$;
 
@@ -251,20 +256,244 @@ RETURNS public.user_role
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
+SET search_path = public
 AS $$
   SELECT role FROM public.profiles WHERE id = auth.uid();
 $$;
 
--- Profiles
+-- Trigger auto-confirm email & bootstrap Admin pertama kali (akun lain hanya dibuat lewat Admin)
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  -- Aktifkan akun langsung tanpa perlu verifikasi email
+  BEGIN
+    UPDATE auth.users
+    SET email_confirmed_at = COALESCE(email_confirmed_at, NOW())
+    WHERE id = NEW.id AND email_confirmed_at IS NULL;
+  EXCEPTION WHEN OTHERS THEN null;
+  END;
+
+  -- Hanya auto-buat profil saat inisialisasi Admin pertama;
+  -- akun Guru / Wali / Admin berikutnya hanya boleh didaftarkan oleh Admin via tabel profiles.
+  IF NOT EXISTS (SELECT 1 FROM public.profiles WHERE role = 'admin') THEN
+    INSERT INTO public.profiles (id, email, full_name, nip_nuptk, role)
+    VALUES (
+      NEW.id,
+      COALESCE(NEW.email, ''),
+      COALESCE(NULLIF(TRIM(NEW.raw_user_meta_data->>'full_name'), ''), split_part(COALESCE(NEW.email, 'User'), '@', 1)),
+      COALESCE(NEW.raw_user_meta_data->>'nip_nuptk', ''),
+      'admin'
+    )
+    ON CONFLICT (id) DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DO $$ BEGIN
+  DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+  CREATE TRIGGER on_auth_user_created
+    AFTER INSERT ON auth.users
+    FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+EXCEPTION WHEN insufficient_privilege OR undefined_table THEN null;
+END $$;
+
+-- Backfill otomatis & konfirmasi akun auth.users yang sudah ada sebelum skrip SQL ini dijalankan
+DO $$ BEGIN
+  UPDATE auth.users
+  SET email_confirmed_at = COALESCE(email_confirmed_at, NOW())
+  WHERE email_confirmed_at IS NULL;
+
+  INSERT INTO public.profiles (id, email, full_name, nip_nuptk, role)
+  SELECT
+    u.id,
+    COALESCE(u.email, ''),
+    COALESCE(NULLIF(TRIM(u.raw_user_meta_data->>'full_name'), ''), split_part(COALESCE(u.email, 'User'), '@', 1)),
+    COALESCE(u.raw_user_meta_data->>'nip_nuptk', ''),
+    CASE
+      WHEN u.raw_user_meta_data->>'role' = 'wali_kelas' THEN 'wali_kelas'::public.user_role
+      ELSE 'guru'::public.user_role
+    END
+  FROM auth.users u
+  ON CONFLICT (id) DO NOTHING;
+
+  UPDATE public.profiles
+  SET role = 'admin'
+  WHERE id = (
+    SELECT p.id FROM public.profiles p
+    JOIN auth.users u ON u.id = p.id
+    WHERE COALESCE(u.raw_user_meta_data->>'role', '') NOT IN ('guru', 'wali_kelas')
+    ORDER BY p.created_at ASC
+    LIMIT 1
+  )
+  AND NOT EXISTS (SELECT 1 FROM public.profiles WHERE role = 'admin');
+EXCEPTION WHEN insufficient_privilege OR undefined_table THEN null;
+END $$;
+
+-- Profiles (Hanya Admin yang dapat mendaftarkan atau menghapus akun pengguna)
 DROP POLICY IF EXISTS "Profiles readable by authenticated" ON public.profiles;
 CREATE POLICY "Profiles readable by authenticated" ON public.profiles
   FOR SELECT TO authenticated USING (true);
 
 DROP POLICY IF EXISTS "Profiles modifiable by admin or self" ON public.profiles;
-CREATE POLICY "Profiles modifiable by admin or self" ON public.profiles
-  FOR ALL TO authenticated
-  USING (auth.uid() = id OR public.get_my_role() = 'admin')
-  WITH CHECK (auth.uid() = id OR public.get_my_role() = 'admin');
+DROP POLICY IF EXISTS "Profiles insertable by admin only" ON public.profiles;
+DROP POLICY IF EXISTS "Profiles updatable by admin or self" ON public.profiles;
+DROP POLICY IF EXISTS "Profiles deletable by admin only" ON public.profiles;
+
+CREATE POLICY "Profiles insertable by admin only" ON public.profiles
+  FOR INSERT TO authenticated
+  WITH CHECK (public.get_my_role() = 'admin');
+
+CREATE POLICY "Profiles updatable by admin or self" ON public.profiles
+  FOR UPDATE TO authenticated
+  USING (public.get_my_role() = 'admin' OR auth.uid() = id)
+  WITH CHECK (
+    public.get_my_role() = 'admin'
+    OR (auth.uid() = id AND role = public.get_my_role())
+  );
+
+CREATE POLICY "Profiles deletable by admin only" ON public.profiles
+  FOR DELETE TO authenticated
+  USING (public.get_my_role() = 'admin');
+
+-- Fungsi RPC Khusus Admin untuk membuat akun Auth + Profil langsung aktif tanpa verifikasi email
+-- (Tetap bekerja meskipun "Allow new users to sign up" / Email signups dimatikan di Supabase Dashboard)
+CREATE OR REPLACE FUNCTION public.admin_create_user(
+  p_email TEXT,
+  p_password TEXT,
+  p_full_name TEXT,
+  p_nip_nuptk TEXT DEFAULT '',
+  p_nrks TEXT DEFAULT '',
+  p_role TEXT DEFAULT 'guru',
+  p_assigned_class_id TEXT DEFAULT NULL
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, auth, extensions
+AS $$
+DECLARE
+  v_email TEXT := lower(trim(COALESCE(p_email, '')));
+  v_name TEXT := trim(COALESCE(p_full_name, ''));
+  v_nip TEXT := trim(COALESCE(p_nip_nuptk, ''));
+  v_nrks TEXT := trim(COALESCE(p_nrks, ''));
+  v_role public.user_role;
+  v_user_id UUID;
+BEGIN
+  IF auth.uid() IS NULL OR public.get_my_role() IS DISTINCT FROM 'admin' THEN
+    RAISE EXCEPTION 'Hanya Admin Sekolah yang dapat mendaftarkan akun baru.';
+  END IF;
+
+  IF v_email !~* '^[^\s@]+@[^\s@]+\.[^\s@]+$' THEN
+    RAISE EXCEPTION 'Format email tidak valid.';
+  END IF;
+
+  IF length(v_name) < 2 THEN
+    RAISE EXCEPTION 'Nama lengkap minimal 2 karakter.';
+  END IF;
+
+  IF length(COALESCE(p_password, '')) < 6 THEN
+    RAISE EXCEPTION 'Kata sandi minimal 6 karakter.';
+  END IF;
+
+  IF p_role NOT IN ('admin', 'guru', 'wali_kelas') THEN
+    RAISE EXCEPTION 'Role harus admin, guru, atau wali_kelas.';
+  END IF;
+  v_role := p_role::public.user_role;
+
+  IF EXISTS (SELECT 1 FROM auth.users WHERE lower(email) = v_email) THEN
+    RAISE EXCEPTION 'Email tersebut sudah terdaftar di Supabase Authentication.';
+  END IF;
+
+  v_user_id := gen_random_uuid();
+
+  INSERT INTO auth.users (
+    instance_id,
+    id,
+    aud,
+    role,
+    email,
+    encrypted_password,
+    email_confirmed_at,
+    raw_app_meta_data,
+    raw_user_meta_data,
+    created_at,
+    updated_at,
+    confirmation_token,
+    email_change,
+    email_change_token_new,
+    recovery_token
+  )
+  VALUES (
+    '00000000-0000-0000-0000-000000000000',
+    v_user_id,
+    'authenticated',
+    'authenticated',
+    v_email,
+    crypt(p_password, gen_salt('bf')),
+    NOW(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    jsonb_build_object(
+      'full_name', v_name,
+      'nip_nuptk', v_nip,
+      'role', p_role,
+      'assigned_class_id', NULLIF(trim(COALESCE(p_assigned_class_id, '')), '')
+    ),
+    NOW(),
+    NOW(),
+    '',
+    '',
+    '',
+    ''
+  );
+
+  INSERT INTO auth.identities (
+    id,
+    user_id,
+    identity_data,
+    provider,
+    provider_id,
+    last_sign_in_at,
+    created_at,
+    updated_at
+  )
+  VALUES (
+    gen_random_uuid(),
+    v_user_id,
+    jsonb_build_object(
+      'sub', v_user_id::text,
+      'email', v_email,
+      'email_verified', true,
+      'phone_verified', false
+    ),
+    'email',
+    v_user_id::text,
+    NOW(),
+    NOW(),
+    NOW()
+  )
+  ON CONFLICT DO NOTHING;
+
+  INSERT INTO public.profiles (id, email, full_name, nip_nuptk, nrks, role)
+  VALUES (v_user_id, v_email, v_name, v_nip, v_nrks, v_role)
+  ON CONFLICT (id) DO UPDATE SET
+    email = EXCLUDED.email,
+    full_name = EXCLUDED.full_name,
+    nip_nuptk = EXCLUDED.nip_nuptk,
+    nrks = EXCLUDED.nrks,
+    role = EXCLUDED.role,
+    updated_at = NOW();
+
+  RETURN v_user_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.admin_create_user(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.admin_create_user(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) TO authenticated;
 
 -- School Settings
 DROP POLICY IF EXISTS "Settings readable by authenticated" ON public.school_settings;

@@ -492,102 +492,21 @@ async function startServer() {
     res.json({ token, user: sanitizeUser(adminUser, true) });
   });
 
-  // Self-service registration for Guru Mata Pelajaran & Wali Kelas
-  app.post('/api/auth/register', (req, res) => {
-    const { email, fullName, nipNuptk, role, assignedClassId, password } = req.body as {
-      email?: string;
-      fullName?: string;
-      nipNuptk?: string;
-      role?: unknown;
-      assignedClassId?: string;
-      password?: string;
-    };
-
-    if (!isValidEmail(email)) {
-      res.status(400).json({ error: 'Format email sekolah tidak valid.' });
-      return;
-    }
-    if (typeof fullName !== 'string' || fullName.trim().length < 2) {
-      res.status(400).json({ error: 'Nama lengkap & gelar minimal 2 karakter.' });
-      return;
-    }
-    if (role !== 'guru' && role !== 'wali_kelas') {
-      res.status(403).json({
-        error: 'Pendaftaran mandiri hanya tersedia untuk peran Guru Mata Pelajaran atau Wali Kelas.',
-      });
-      return;
-    }
-    if (typeof password !== 'string' || password.length < 6) {
-      res.status(400).json({ error: 'Kata sandi minimal 6 karakter.' });
-      return;
-    }
-
-    const users = loadUsers();
-    const normalizedEmail = email.trim().toLowerCase();
-    const existingIdx = users.findIndex((u) => u.email.toLowerCase() === normalizedEmail);
-    const now = new Date().toISOString();
-    const { salt, hash } = hashPassword(password);
-
-    let registeredUser: StoredAuthUser;
-    if (existingIdx >= 0) {
-      const existing = users[existingIdx];
-      if (existing.role === 'admin' || existing.passwordHash) {
-        res.status(409).json({
-          error: 'Email tersebut sudah terdaftar dan aktif. Silakan masuk menggunakan kata sandi Anda.',
-        });
-        return;
-      }
-      if (!existing.isActive) {
-        res.status(403).json({ error: 'Akun ini sedang dinonaktifkan oleh Admin Sekolah.' });
-        return;
-      }
-      registeredUser = {
-        ...existing,
-        fullName: fullName.trim(),
-        nipNuptk: typeof nipNuptk === 'string' && nipNuptk.trim() ? nipNuptk.trim() : existing.nipNuptk,
-        role,
-        assignedClassId:
-          role === 'wali_kelas' && typeof assignedClassId === 'string' && assignedClassId.trim()
-            ? assignedClassId.trim()
-            : existing.assignedClassId,
-        passwordSalt: salt,
-        passwordHash: hash,
-        updatedAt: now,
-      };
-      users[existingIdx] = registeredUser;
-    } else {
-      registeredUser = {
-        id: `user-${role}-${Date.now()}`,
-        email: normalizedEmail,
-        fullName: fullName.trim(),
-        nipNuptk: typeof nipNuptk === 'string' ? nipNuptk.trim() : '',
-        nrks: role === 'wali_kelas' ? 'WK' : 'GR',
-        role,
-        isActive: true,
-        assignedClassId:
-          role === 'wali_kelas' && typeof assignedClassId === 'string' && assignedClassId.trim()
-            ? assignedClassId.trim()
-            : undefined,
-        passwordSalt: salt,
-        passwordHash: hash,
-        createdAt: now,
-        updatedAt: now,
-      };
-      users.push(registeredUser);
-    }
-
-    saveUsers(users);
-    const token = signSessionToken({
-      sub: registeredUser.id,
-      role: registeredUser.role,
-      isDemo: false,
+  // Public self-registration disabled: only Admin Sekolah can register new accounts
+  app.post('/api/auth/register', (_req, res) => {
+    res.status(403).json({
+      error:
+        'Pendaftaran mandiri dinonaktifkan. Hanya Admin Sekolah yang dapat mendaftarkan akun baru.',
     });
-    res.status(201).json({ token, user: sanitizeUser(registeredUser, true) });
   });
 
   // Email + Password Login
   app.post('/api/auth/login', (req, res) => {
-    const { email, password } = req.body as { email?: string; password?: string };
+    const { email, password, expectedRole } = req.body as {
+      email?: string;
+      password?: string;
+      expectedRole?: unknown;
+    };
     if (!isValidEmail(email) || typeof password !== 'string' || password.length === 0) {
       res.status(400).json({ error: 'Email dan kata sandi wajib diisi.' });
       return;
@@ -620,7 +539,19 @@ async function startServer() {
       res.status(401).json({
         error: user.passwordHash
           ? 'Email atau kata sandi tidak sesuai.'
-          : 'Akun belum memiliki kata sandi. Silakan aktifkan melalui tab "Daftar Guru / Wali" atau hubungi Admin Sekolah.',
+          : 'Akun belum memiliki kata sandi. Hubungi Admin Sekolah untuk mengatur kata sandi.',
+      });
+      return;
+    }
+
+    if (expectedRole !== undefined && isValidRole(expectedRole) && user.role !== expectedRole) {
+      const roleLabels: Record<UserRole, string> = {
+        admin: 'Admin / Operator',
+        guru: 'Guru Mata Pelajaran',
+        wali_kelas: 'Wali Kelas',
+      };
+      res.status(403).json({
+        error: `Akun ini terdaftar sebagai ${roleLabels[user.role]}, bukan ${roleLabels[expectedRole]}. Silakan pilih role "${roleLabels[user.role]}".`,
       });
       return;
     }
@@ -692,8 +623,8 @@ async function startServer() {
     });
   });
 
-  // Admin: Create new user account with role & initial password
-  app.post('/api/users', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  // Admin: Create new user account (immediately active without email verification)
+  app.post('/api/users', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res) => {
     const { email, fullName, nipNuptk, nrks, role, password, assignedClassId } = req.body as {
       email?: string;
       fullName?: string;
@@ -728,20 +659,83 @@ async function startServer() {
       return;
     }
 
+    const cleanName = fullName.trim();
+    const cleanNip = typeof nipNuptk === 'string' ? nipNuptk.trim() : '';
+    const cleanNrks = typeof nrks === 'string' ? nrks.trim() : '';
+    const cleanAssignedClassId =
+      role === 'wali_kelas' && typeof assignedClassId === 'string' && assignedClassId.trim()
+        ? assignedClassId.trim()
+        : undefined;
+
+    let supabaseUserId: string | null = null;
+    let supabaseConfirmed = false;
+    const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+    const envCfg = getEnvSupabaseConfig();
+    const savedCfg = loadSavedSupabaseConfig();
+    const supabaseUrl = envCfg.url || savedCfg.url;
+
+    if (serviceRoleKey && supabaseUrl) {
+      try {
+        const sbRes = await fetch(`${supabaseUrl}/auth/v1/admin/users`, {
+          method: 'POST',
+          headers: {
+            apikey: serviceRoleKey,
+            Authorization: `Bearer ${serviceRoleKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email: normalizedEmail,
+            password,
+            email_confirm: true,
+            user_metadata: {
+              full_name: cleanName,
+              nip_nuptk: cleanNip,
+              role,
+              assigned_class_id: cleanAssignedClassId || null,
+            },
+          }),
+        });
+        if (sbRes.ok) {
+          const sbJson = (await sbRes.json()) as { id?: string; user?: { id?: string } };
+          const createdUid = sbJson.id || sbJson.user?.id || null;
+          if (createdUid) {
+            supabaseUserId = createdUid;
+            supabaseConfirmed = true;
+            await fetch(`${supabaseUrl}/rest/v1/profiles`, {
+              method: 'POST',
+              headers: {
+                apikey: serviceRoleKey,
+                Authorization: `Bearer ${serviceRoleKey}`,
+                'Content-Type': 'application/json',
+                Prefer: 'resolution=merge-duplicates',
+              },
+              body: JSON.stringify({
+                id: createdUid,
+                email: normalizedEmail,
+                full_name: cleanName,
+                nip_nuptk: cleanNip,
+                nrks: cleanNrks,
+                role,
+              }),
+            }).catch(() => {});
+          }
+        }
+      } catch {
+        // Fall back to local Express storage + client-side mirror if service role call fails
+      }
+    }
+
     const now = new Date().toISOString();
     const { salt, hash } = hashPassword(password);
     const created: StoredAuthUser = {
-      id: `user-${role}-${Date.now()}`,
+      id: supabaseUserId || `user-${role}-${Date.now()}`,
       email: normalizedEmail,
-      fullName: fullName.trim(),
-      nipNuptk: typeof nipNuptk === 'string' ? nipNuptk.trim() : '',
-      nrks: typeof nrks === 'string' ? nrks.trim() : '',
+      fullName: cleanName,
+      nipNuptk: cleanNip,
+      nrks: cleanNrks,
       role,
       isActive: true,
-      assignedClassId:
-        role === 'wali_kelas' && typeof assignedClassId === 'string' && assignedClassId.trim()
-          ? assignedClassId.trim()
-          : undefined,
+      assignedClassId: cleanAssignedClassId,
       passwordSalt: salt,
       passwordHash: hash,
       createdAt: now,
@@ -750,7 +744,7 @@ async function startServer() {
 
     users.push(created);
     saveUsers(users);
-    res.status(201).json({ user: sanitizeUser(created, true) });
+    res.status(201).json({ user: sanitizeUser(created, true), supabaseConfirmed });
   });
 
   // Admin: Update user profile, role, active state, or reset password

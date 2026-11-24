@@ -229,6 +229,14 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
         </div>
       );
     }
+    if (connectionMode === 'supabase' && syncStatus === 'error') {
+      return (
+        <div className="flex items-center gap-1.5 text-xs text-amber-700 font-medium whitespace-nowrap shrink-0">
+          <CloudOff className="w-3.5 h-3.5 text-amber-600" />
+          <span className="font-mono tabular-nums">Supabase Perlu Sesi/SQL · {lastSavedAt}</span>
+        </div>
+      );
+    }
     return (
       <div className="flex items-center gap-1.5 text-xs text-slate-600 font-medium whitespace-nowrap shrink-0">
         <CloudOff className="w-3.5 h-3.5 text-slate-500" />
