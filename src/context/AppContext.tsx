@@ -382,6 +382,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const safeParseAuthResponse = async <T extends object>(
     res: Response
   ): Promise<{ ok: boolean; status: number; data?: T; rawError?: string }> => {
+    if (res.redirected && res.url.includes('__cookie_check')) {
+      return {
+        ok: false,
+        status: 401,
+        rawError:
+          'Browser memblokir cookie sesi pratinjau. Izinkan cookie untuk situs ini atau gunakan tab "Masuk Akun" melalui Supabase.',
+      };
+    }
+
     const text = await res.text();
     try {
       const parsed = JSON.parse(text) as T;
@@ -392,7 +401,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           ok: false,
           status: res.status,
           rawError:
-            'Layanan backend (/api) tidak ditemukan di URL ini (404). Jika Anda membuka Shared/Static URL, pastikan aplikasi dibuka melalui Development URL atau sudah dipublikasikan dengan server aktif.',
+            'Layanan backend (/api) tidak aktif di URL ini (404). Aplikasi berjalan di mode koneksi langsung Supabase.',
         };
       }
       if (res.status >= 500) {
@@ -405,7 +414,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return {
         ok: false,
         status: res.status,
-        rawError: 'Respon server bukan JSON yang valid. Pastikan server Express berjalan di port 3000.',
+        rawError: 'Respon server bukan JSON yang valid.',
       };
     }
   };
@@ -413,7 +422,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const refreshAuthStatus = async () => {
     const attempt = async (): Promise<boolean> => {
       try {
-        const res = await fetch('/api/auth/status');
+        const res = await fetch('/api/auth/status', { credentials: 'same-origin' });
         const parsed = await safeParseAuthResponse<AuthSystemStatus>(res);
         if (parsed.ok && parsed.data) {
           setAuthStatus({
@@ -569,6 +578,41 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     initSupabase();
   }, []);
+
+  // Auto-recover auth server reachability while on login screen if server was restarting
+  useEffect(() => {
+    if (currentUser || !authStatus.statusChecked || authStatus.serverReachable !== false) {
+      return;
+    }
+    let cancelled = false;
+    let attempts = 0;
+    const timer = window.setInterval(async () => {
+      if (cancelled || attempts >= 5) {
+        window.clearInterval(timer);
+        return;
+      }
+      attempts += 1;
+      try {
+        const res = await fetch('/api/auth/status', { credentials: 'same-origin' });
+        const parsed = await safeParseAuthResponse<AuthSystemStatus>(res);
+        if (!cancelled && parsed.ok && parsed.data) {
+          setAuthStatus({
+            ...parsed.data,
+            serverReachable: true,
+            statusChecked: true,
+          });
+          window.clearInterval(timer);
+        }
+      } catch {
+        // keep polling silently
+      }
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [currentUser, authStatus.statusChecked, authStatus.serverReachable]);
 
   // Persist notifications locally whenever updated
   useEffect(() => {
@@ -1081,37 +1125,97 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     password: string
   ): Promise<{ ok: boolean; error?: string }> => {
     const client = getSupabaseClient();
+    let supabaseErrorMessage = '';
+
     if (client) {
-      const { data, error } = await client.auth.signInWithPassword({ email, password });
-      if (!error && data.user) {
-        const { data: profile } = await client
-          .from('profiles')
-          .select('*')
-          .eq('id', data.user.id)
-          .single();
-        if (profile) {
-          const mapped: AuthUserSummary = {
-            id: profile.id,
-            email: profile.email,
-            fullName: profile.full_name,
-            nipNuptk: profile.nip_nuptk || '',
-            nrks: profile.nrks || '',
-            role: profile.role,
-            avatarUrl: profile.avatar_url || undefined,
-            isActive: true,
-          };
+      try {
+        const { data, error } = await client.auth.signInWithPassword({ email, password });
+        if (!error && data.user) {
+          const { data: profile } = await client
+            .from('profiles')
+            .select('*')
+            .eq('id', data.user.id)
+            .maybeSingle();
+
+          const meta = (data.user.user_metadata || {}) as Record<string, unknown>;
+          const safeMetaRole: UserRole =
+            meta.role === 'wali_kelas' ? 'wali_kelas' : 'guru';
+
+          let activeProfile = profile;
+          if (!activeProfile) {
+            const fullName =
+              typeof meta.full_name === 'string' && meta.full_name.trim()
+                ? meta.full_name.trim()
+                : email.split('@')[0];
+            const nipNuptk =
+              typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk.trim() : '';
+            const { data: inserted } = await client
+              .from('profiles')
+              .upsert(
+                {
+                  id: data.user.id,
+                  email: data.user.email || email.trim().toLowerCase(),
+                  full_name: fullName,
+                  nip_nuptk: nipNuptk,
+                  role: safeMetaRole,
+                },
+                { onConflict: 'id' }
+              )
+              .select('*')
+              .maybeSingle();
+            activeProfile = inserted;
+          }
+
+          const mapped: AuthUserSummary = activeProfile
+            ? {
+                id: activeProfile.id,
+                email: activeProfile.email,
+                fullName: activeProfile.full_name,
+                nipNuptk: activeProfile.nip_nuptk || '',
+                nrks: activeProfile.nrks || '',
+                role: activeProfile.role,
+                avatarUrl: activeProfile.avatar_url || undefined,
+                assignedClassId:
+                  typeof meta.assigned_class_id === 'string'
+                    ? meta.assigned_class_id
+                    : undefined,
+                isActive: true,
+              }
+            : {
+                id: data.user.id,
+                email: data.user.email || email.trim().toLowerCase(),
+                fullName:
+                  typeof meta.full_name === 'string' && meta.full_name.trim()
+                    ? meta.full_name.trim()
+                    : email.split('@')[0],
+                nipNuptk: typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk : '',
+                nrks: '',
+                role: safeMetaRole,
+                assignedClassId:
+                  typeof meta.assigned_class_id === 'string'
+                    ? meta.assigned_class_id
+                    : undefined,
+                isActive: true,
+              };
+
           setCurrentUser(mapped);
           setConnectionMode('supabase');
           setSyncStatus('connected');
           applyAuthenticatedFocus(mapped);
           return { ok: true };
         }
+        if (error) {
+          supabaseErrorMessage = error.message;
+        }
+      } catch {
+        // fall through to backend auth
       }
     }
 
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
@@ -1121,6 +1225,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         error?: string;
       }>(res);
       if (parsed.rawError) {
+        if (client && supabaseErrorMessage) {
+          if (supabaseErrorMessage.toLowerCase().includes('email not confirmed')) {
+            return {
+              ok: false,
+              error: 'Email belum dikonfirmasi di Supabase. Cek inbox email Anda terlebih dahulu.',
+            };
+          }
+          return {
+            ok: false,
+            error:
+              'Email atau kata sandi belum terdaftar di Supabase Auth. Gunakan tab "Daftar Guru / Wali" atau buat akun di Supabase Authentication.',
+          };
+        }
         return { ok: false, error: parsed.rawError };
       }
       const data = parsed.data || {};
@@ -1137,6 +1254,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
     } catch {
+      if (client && supabaseErrorMessage) {
+        return {
+          ok: false,
+          error: 'Email atau kata sandi tidak sesuai di Supabase Auth.',
+        };
+      }
       return {
         ok: false,
         error:
@@ -1153,9 +1276,81 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     assignedClassId?: string;
     password: string;
   }): Promise<{ ok: boolean; error?: string }> => {
+    const registerViaSupabase = async (): Promise<{ ok: boolean; error?: string } | null> => {
+      const client = getSupabaseClient();
+      if (!client) return null;
+      try {
+        const { data, error } = await client.auth.signUp({
+          email: payload.email.trim().toLowerCase(),
+          password: payload.password,
+          options: {
+            data: {
+              full_name: payload.fullName.trim(),
+              nip_nuptk: (payload.nipNuptk || '').trim(),
+              role: payload.role,
+              assigned_class_id: payload.assignedClassId || null,
+            },
+          },
+        });
+        if (error) {
+          return { ok: false, error: error.message };
+        }
+        if (!data.user) {
+          return { ok: false, error: 'Gagal membuat akun di Supabase.' };
+        }
+        if (!data.session) {
+          return {
+            ok: false,
+            error:
+              'Akun berhasil dibuat di Supabase! Silakan cek inbox email Anda untuk konfirmasi lalu masuk di tab "Masuk Akun".',
+          };
+        }
+
+        await client.from('profiles').upsert(
+          {
+            id: data.user.id,
+            email: payload.email.trim().toLowerCase(),
+            full_name: payload.fullName.trim(),
+            nip_nuptk: (payload.nipNuptk || '').trim(),
+            role: payload.role,
+          },
+          { onConflict: 'id' }
+        );
+
+        const registered: AuthUserSummary = {
+          id: data.user.id,
+          email: payload.email.trim().toLowerCase(),
+          fullName: payload.fullName.trim(),
+          nipNuptk: (payload.nipNuptk || '').trim(),
+          nrks: payload.role === 'wali_kelas' ? 'WK' : 'GR',
+          role: payload.role,
+          assignedClassId:
+            payload.role === 'wali_kelas' ? payload.assignedClassId : undefined,
+          isActive: true,
+        };
+        if (registered.role === 'wali_kelas' && registered.assignedClassId) {
+          setClasses((prev) =>
+            prev.map((c) =>
+              c.id === registered.assignedClassId
+                ? { ...c, homeroomTeacherId: registered.id }
+                : c
+            )
+          );
+        }
+        setCurrentUser(registered);
+        setConnectionMode('supabase');
+        setSyncStatus('connected');
+        applyAuthenticatedFocus(registered);
+        return { ok: true };
+      } catch {
+        return null;
+      }
+    };
+
     try {
       const res = await fetch('/api/auth/register', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
@@ -1165,6 +1360,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         error?: string;
       }>(res);
       if (parsed.rawError) {
+        const sbResult = await registerViaSupabase();
+        if (sbResult) return sbResult;
         return { ok: false, error: parsed.rawError };
       }
       const data = parsed.data || {};
@@ -1189,6 +1386,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
     } catch {
+      const sbResult = await registerViaSupabase();
+      if (sbResult) return sbResult;
       return { ok: false, error: 'Tidak dapat terhubung ke server pendaftaran.' };
     }
   };

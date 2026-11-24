@@ -4,6 +4,7 @@ import {
   ArrowRight,
   BookOpen,
   Calculator,
+  Database,
   Eye,
   EyeOff,
   FileSpreadsheet,
@@ -17,6 +18,7 @@ import {
   UserPlus,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { getSupabaseConfig } from '../lib/supabase';
 import { SchoolCrest } from './SchoolCrest';
 
 export function AuthScreen() {
@@ -54,6 +56,10 @@ export function AuthScreen() {
 
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+
+  const supabaseCfg = getSupabaseConfig();
+  const isSupabaseConnected =
+    connectionMode === 'supabase' || Boolean(supabaseCfg.url && supabaseCfg.anonKey);
 
   const canClaimAdmin =
     Boolean(authStatus.statusChecked) &&
@@ -254,25 +260,47 @@ export function AuthScreen() {
           </div>
 
           {authStatus.statusChecked && authStatus.serverReachable === false && (
-            <div className="mb-4 p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start justify-between gap-3">
-              <div className="flex items-start gap-2.5">
-                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                <div>
-                  <div className="font-semibold">Server autentikasi belum merespons</div>
-                  <p className="text-amber-800/90 mt-0.5 leading-relaxed">
-                    Pastikan Anda mengakses aplikasi melalui Development/Server URL yang aktif (bukan halaman statis tanpa backend), atau tunggu beberapa detik jika server sedang restart.
-                  </p>
+            isSupabaseConnected ? (
+              <div className="mb-4 p-3.5 rounded-xl bg-sky-50 border border-sky-200 text-xs text-sky-900 flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <Database className="w-4 h-4 text-sky-700 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-semibold">Mode Autentikasi Langsung Supabase Aktif</div>
+                    <p className="text-sky-800/90 mt-0.5 leading-relaxed">
+                      Aplikasi terhubung langsung ke Supabase Cloud. Anda dapat masuk atau mendaftar akun Guru / Wali Kelas melalui Supabase Auth dari browser mana saja.
+                    </p>
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => refreshAuthStatus()}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold text-sky-900 bg-white border border-sky-300 hover:bg-sky-100 rounded-lg shrink-0"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Cek Server</span>
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => refreshAuthStatus()}
-                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold text-amber-900 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg shrink-0"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Coba Lagi</span>
-              </button>
-            </div>
+            ) : (
+              <div className="mb-4 p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-semibold">Server autentikasi belum merespons</div>
+                    <p className="text-amber-800/90 mt-0.5 leading-relaxed">
+                      Pastikan Anda membuka Development/Server URL yang aktif, atau tunggu beberapa detik sementara server memulai ulang.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => refreshAuthStatus()}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold text-amber-900 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg shrink-0"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Coba Lagi</span>
+                </button>
+              </div>
+            )
           )}
 
           <div className="inline-flex flex-wrap p-1 bg-slate-100 rounded-xl border border-slate-200 mb-5 self-start">
