@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
@@ -40,17 +40,23 @@ export function AuthScreen() {
 
   // Teacher / Homeroom registration state
   const [regRole, setRegRole] = useState<'guru' | 'wali_kelas'>('guru');
-  const [regClassId, setRegClassId] = useState<string>(classes[0]?.id || 'kelas-xi-ipas');
+  const [regClassId, setRegClassId] = useState<string>(classes[0]?.id || '');
   const [regName, setRegName] = useState('');
   const [regNip, setRegNip] = useState('');
   const [regEmail, setRegEmail] = useState('');
   const [regPassword, setRegPassword] = useState('');
   const [regConfirm, setRegConfirm] = useState('');
 
+  useEffect(() => {
+    if (!regClassId && classes.length > 0) {
+      setRegClassId(classes[0].id);
+    }
+  }, [classes, regClassId]);
+
   // First-run Admin claim state
-  const [claimEmail, setClaimEmail] = useState('operator@smapasundan9bdg.sch.id');
-  const [claimName, setClaimName] = useState('Raden Budi Santoso, S.Kom.');
-  const [claimNip, setClaimNip] = useState('198604122010011008');
+  const [claimEmail, setClaimEmail] = useState('');
+  const [claimName, setClaimName] = useState('');
+  const [claimNip, setClaimNip] = useState('');
   const [claimPassword, setClaimPassword] = useState('');
   const [claimConfirm, setClaimConfirm] = useState('');
 
@@ -497,11 +503,15 @@ export function AuthScreen() {
                     onChange={(e) => setRegClassId(e.target.value)}
                     className="w-full px-3 py-2 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
                   >
-                    {classes.map((cls) => (
-                      <option key={cls.id} value={cls.id}>
-                        {cls.name} (Fase {cls.fase})
-                      </option>
-                    ))}
+                    {classes.length === 0 ? (
+                      <option value="">Belum ada kelas (akan diatur oleh Admin)</option>
+                    ) : (
+                      classes.map((cls) => (
+                        <option key={cls.id} value={cls.id}>
+                          {cls.name} (Fase {cls.fase})
+                        </option>
+                      ))
+                    )}
                   </select>
                 </div>
               )}

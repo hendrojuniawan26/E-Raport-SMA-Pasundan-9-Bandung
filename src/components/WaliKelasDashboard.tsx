@@ -170,6 +170,7 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
   const selectedClass = classes.find((c) => c.id === focusedClassId) || classes[0];
 
   const homeroomTeacher = useMemo(() => {
+    if (!selectedClass) return undefined;
     return (
       users.find((u) => u.role === 'wali_kelas' && u.assignedClassId === selectedClass.id) ||
       users.find((u) => u.id === selectedClass.homeroomTeacherId)
@@ -177,15 +178,20 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
   }, [users, selectedClass]);
 
   const classStudents = useMemo(
-    () => students.filter((s) => s.classId === selectedClass.id && s.isActive),
-    [students, selectedClass.id]
+    () =>
+      selectedClass
+        ? students.filter((s) => s.classId === selectedClass.id && s.isActive)
+        : [],
+    [students, selectedClass]
   );
 
   const classSubjects = useMemo(
     () =>
-      subjects
-        .filter((sub) => isSubjectForClass(sub, selectedClass))
-        .sort((a, b) => a.sortOrder - b.sortOrder),
+      selectedClass
+        ? subjects
+            .filter((sub) => isSubjectForClass(sub, selectedClass))
+            .sort((a, b) => a.sortOrder - b.sortOrder)
+        : [],
     [subjects, selectedClass]
   );
 
@@ -414,9 +420,11 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
     const passRatePct =
       scored.length > 0 ? Math.round((passedAllCount / scored.length) * 100) : 0;
 
-    const sentSubjectsCount = classSubjects.filter(
-      (sub) => getGradeSubmission(selectedClass.id, sub.id)?.status === 'sent'
-    ).length;
+    const sentSubjectsCount = selectedClass
+      ? classSubjects.filter(
+          (sub) => getGradeSubmission(selectedClass.id, sub.id)?.status === 'sent'
+        ).length
+      : 0;
 
     const homeroomCompletedCount = studentRows.filter(
       (r) => r.hasNote || r.ekskulCount > 0 || r.p5Count > 0
@@ -443,7 +451,7 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
       totalAlpha,
       zeroAlphaCount,
     };
-  }, [studentRows, classSubjects, selectedClass.id, getGradeSubmission]);
+  }, [studentRows, classSubjects, selectedClass, getGradeSubmission]);
 
   const activeBucket = distributionData.find((b) => b.id === selectedBucketId) || null;
 
@@ -478,6 +486,20 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
   }, [studentRows, activeBucket, progressFilter, searchQuery]);
 
   const hasAnyScores = classKpis.scoredStudents > 0;
+
+  if (!selectedClass) {
+    return (
+      <div className="bg-white border border-slate-200/90 rounded-2xl p-10 text-center space-y-2.5">
+        <Users className="w-8 h-8 text-slate-400 mx-auto" />
+        <div className="text-sm font-semibold text-slate-900">
+          Belum Ada Data Kelas di Supabase
+        </div>
+        <p className="text-xs text-slate-500 max-w-md mx-auto">
+          Tambahkan kelas dan peserta didik melalui akun Admin pada menu Master Data agar ringkasan performa wali kelas dapat ditampilkan.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

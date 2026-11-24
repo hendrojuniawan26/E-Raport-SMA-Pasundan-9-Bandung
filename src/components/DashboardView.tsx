@@ -36,15 +36,20 @@ export function DashboardView() {
   const selectedClass = classes.find((c) => c.id === focusedClassId) || classes[0];
 
   const classStudents = useMemo(
-    () => students.filter((s) => s.classId === selectedClass.id && s.isActive),
-    [students, selectedClass.id]
+    () =>
+      selectedClass
+        ? students.filter((s) => s.classId === selectedClass.id && s.isActive)
+        : [],
+    [students, selectedClass]
   );
 
   const classSubjects = useMemo(
     () =>
-      subjects
-        .filter((sub) => isSubjectForClass(sub, selectedClass))
-        .sort((a, b) => a.sortOrder - b.sortOrder),
+      selectedClass
+        ? subjects
+            .filter((sub) => isSubjectForClass(sub, selectedClass))
+            .sort((a, b) => a.sortOrder - b.sortOrder)
+        : [],
     [subjects, selectedClass]
   );
 
@@ -150,6 +155,30 @@ export function DashboardView() {
           </div>
         </div>
         <WaliKelasDashboard />
+      </div>
+    );
+  }
+
+  if (!selectedClass) {
+    return (
+      <div className="bg-white border border-slate-200/90 rounded-2xl p-10 text-center space-y-3">
+        <Users className="w-9 h-9 text-slate-400 mx-auto" />
+        <h3 className="text-base font-semibold text-slate-900">
+          Belum Ada Data Kelas di Supabase
+        </h3>
+        <p className="text-xs text-slate-500 max-w-md mx-auto leading-relaxed">
+          Data contoh bawaan telah dinonaktifkan. Tambahkan kelas, mata pelajaran, dan peserta didik pada menu Master Data agar analitik akademik aktif.
+        </p>
+        {currentUser?.role === 'admin' && (
+          <button
+            type="button"
+            onClick={() => setActiveTab('master_data')}
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg"
+          >
+            <span>Buka Master Data &amp; Akun</span>
+            <ArrowRight className="w-3.5 h-3.5" />
+          </button>
+        )}
       </div>
     );
   }

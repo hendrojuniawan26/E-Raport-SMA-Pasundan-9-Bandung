@@ -29,28 +29,34 @@ export function ReportCardView() {
     setReportPaperSize,
   } = useApp();
 
-  const [selectedStudentId, setSelectedStudentId] = useState<string>('stu-1');
+  const [selectedStudentId, setSelectedStudentId] = useState<string>('');
   const [printAllMode, setPrintAllMode] = useState<boolean>(false);
   const [previewModalOpen, setPreviewModalOpen] = useState<boolean>(false);
   const [printMargins, setPrintMargins] = useState<PrintMarginsMm>(DEFAULT_PRINT_MARGINS);
 
   const selectedClass = classes.find((c) => c.id === focusedClassId) || classes[0];
   const classStudents = useMemo(
-    () => students.filter((s) => s.classId === selectedClass.id && s.isActive),
-    [students, selectedClass.id]
+    () =>
+      selectedClass
+        ? students.filter((s) => s.classId === selectedClass.id && s.isActive)
+        : [],
+    [students, selectedClass]
   );
 
   const classSubjects = useMemo(
     () =>
-      subjects
-        .filter((sub) => isSubjectForClass(sub, selectedClass))
-        .sort((a, b) => a.sortOrder - b.sortOrder),
+      selectedClass
+        ? subjects
+            .filter((sub) => isSubjectForClass(sub, selectedClass))
+            .sort((a, b) => a.sortOrder - b.sortOrder)
+        : [],
     [subjects, selectedClass]
   );
 
-  const homeroomTeacher =
-    users.find((u) => u.id === selectedClass.homeroomTeacherId) ||
-    users.find((u) => u.role === 'wali_kelas');
+  const homeroomTeacher = selectedClass
+    ? users.find((u) => u.id === selectedClass.homeroomTeacherId) ||
+      users.find((u) => u.role === 'wali_kelas')
+    : undefined;
 
   const activeStudent =
     classStudents.find((s) => s.id === selectedStudentId) || classStudents[0];
@@ -552,6 +558,20 @@ export function ReportCardView() {
 
   const pageDimensionsCss =
     reportPaperSize === 'F4' ? '215mm 330mm' : '210mm 297mm';
+
+  if (!selectedClass) {
+    return (
+      <div className="bg-white border border-slate-200/90 rounded-2xl p-10 text-center space-y-2.5">
+        <FileText className="w-8 h-8 text-slate-400 mx-auto" />
+        <div className="text-sm font-semibold text-slate-900">
+          Belum Ada Data Kelas di Supabase
+        </div>
+        <p className="text-xs text-slate-500 max-w-md mx-auto">
+          Tambahkan kelas dan peserta didik melalui menu Master Data agar pratinjau dan cetak raport A4/F4 dapat ditampilkan.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">

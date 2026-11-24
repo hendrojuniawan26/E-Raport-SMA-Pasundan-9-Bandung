@@ -20,6 +20,7 @@ import {
   Upload,
 } from 'lucide-react';
 import { GuruSubTab, useApp } from '../context/AppContext';
+import { generateUuid } from '../lib/supabaseSync';
 import {
   getRaportSubjectGroup,
   isSubjectForClass,
@@ -84,15 +85,18 @@ export function GradeInputView() {
   const selectedClass = classes.find((c) => c.id === focusedClassId) || classes[0];
   const classSubjects = useMemo(
     () =>
-      subjects
-        .filter((sub) => isSubjectForClass(sub, selectedClass))
-        .sort((a, b) => a.sortOrder - b.sortOrder),
+      selectedClass
+        ? subjects
+            .filter((sub) => isSubjectForClass(sub, selectedClass))
+            .sort((a, b) => a.sortOrder - b.sortOrder)
+        : [],
     [subjects, selectedClass]
   );
   const selectedSubject =
     classSubjects.find((s) => s.id === focusedSubjectId) || classSubjects[0] || subjects[0];
 
   const classStudents = useMemo(() => {
+    if (!selectedClass) return [];
     const q = searchQuery.trim().toLowerCase();
     return students
       .filter((s) => s.classId === selectedClass.id && s.isActive)
@@ -102,22 +106,23 @@ export function GradeInputView() {
           s.fullName.toLowerCase().includes(q) ||
           s.nis.toLowerCase().includes(q)
       );
-  }, [students, selectedClass.id, searchQuery]);
+  }, [students, selectedClass, searchQuery]);
 
   const getOrInitGrade = (studentId: string): SubjectGrade => {
+    const subjectId = selectedSubject?.id || '';
     const existing = grades.find(
-      (g) => g.studentId === studentId && g.subjectId === selectedSubject.id
+      (g) => g.studentId === studentId && g.subjectId === subjectId
     );
-    if (existing) {
+    if (existing && selectedSubject) {
       return recalculateSubjectGrade(existing, selectedSubject, settings);
     }
     const fresh: SubjectGrade = {
-      id: `grade-${studentId}-${selectedSubject.id}`,
+      id: generateUuid(),
       studentId,
-      subjectId: selectedSubject.id,
+      subjectId,
       academicYear: settings.academicYear,
       semester: settings.semester,
-      tpScores: buildEmptyTpScores(selectedSubject.tpList),
+      tpScores: selectedSubject ? buildEmptyTpScores(selectedSubject.tpList) : [],
       sasPpk: null,
       sasPrk: null,
       kehadiran: 90,
@@ -132,12 +137,16 @@ export function GradeInputView() {
     return fresh;
   };
 
-  const submission = getGradeSubmission(selectedClass.id, selectedSubject.id);
+  const submission =
+    selectedClass && selectedSubject
+      ? getGradeSubmission(selectedClass.id, selectedSubject.id)
+      : undefined;
   const submissionStatus = submission?.status || 'draft';
   const isLocked = submissionStatus === 'locked' || submissionStatus === 'sent';
-  const homeroomTeacher =
-    users.find((u) => u.id === selectedClass.homeroomTeacherId) ||
-    users.find((u) => u.role === 'wali_kelas');
+  const homeroomTeacher = selectedClass
+    ? users.find((u) => u.id === selectedClass.homeroomTeacherId) ||
+      users.find((u) => u.role === 'wali_kelas')
+    : undefined;
 
   const formatTimestamp = (iso?: string) => {
     if (!iso) return '';
@@ -323,10 +332,10 @@ export function GradeInputView() {
   };
 
   const handleAddTp = () => {
-    if (isLocked) return;
+    if (isLocked || !selectedSubject) return;
     const nextIdx = selectedSubject.tpList.length + 1;
     const newTp = {
-      id: `${selectedSubject.code.toLowerCase()}-tp-${Date.now()}`,
+      id: generateUuid(),
       code: `Sumatif ${nextIdx}`,
       title: `Tujuan Pembelajaran ${nextIdx}`,
     };
@@ -372,7 +381,7 @@ export function GradeInputView() {
       );
       if (parsed.detectedTpTitles.length > 0 && hasCustomTpTitles) {
         const nextTpList = parsed.detectedTpTitles.map((title, idx) => ({
-          id: selectedSubject.tpList[idx]?.id || `${selectedSubject.code}-tp-${idx + 1}`,
+          id: selectedSubject.tpList[idx]?.id || generateUuid(),
           code: `Sumatif ${idx + 1}`,
           title,
         }));
@@ -398,7 +407,7 @@ export function GradeInputView() {
         );
         if (!stu) {
           stu = {
-            id: `stu-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            id: generateUuid(),
             nis: row.nis,
             nisn: '',
             fullName: row.fullName,
@@ -435,7 +444,7 @@ export function GradeInputView() {
               : null;
 
         const gradeObj: SubjectGrade = {
-          id: `grade-${stu.id}-${updatedSubject.id}`,
+          id: generateUuid(),
           studentId: stu.id,
           subjectId: updatedSubject.id,
           academicYear: settings.academicYear,
@@ -477,11 +486,11 @@ export function GradeInputView() {
   const classRaporScores = classStudents.map(
     (s) => getOrInitGrade(s.id).nilaiAkhir
   );
-  const raporStats = computeColumnStats(classRaporScores, selectedSubject.kktp);
+  const raporStats = computeColumnStats(classRaporScores, selectedSubject?.kktp ?? 70);
 
   const tpColSpan = compactMode ? 1 : 2;
   const totalSummaryCols =
-    selectedSubject.tpList.length * tpColSpan +
+    (selectedSubject?.tpList.length ?? 0) * tpColSpan +
     (compactMode ? 1 : 2) +
     3;
 
@@ -494,6 +503,22 @@ export function GradeInputView() {
     if (avg >= 70) return 'Sedang Berkembang';
     return 'Mulai Berkembang';
   };
+
+  if (!selectedClass || !selectedSubject) {
+    return (
+      <div className="bg-white border border-slate-200/90 rounded-2xl p-10 text-center space-y-2.5">
+        <FileSpreadsheet className="w-8 h-8 text-slate-400 mx-auto" />
+        <h3 className="text-sm font-semibold text-slate-900">
+          {!selectedClass
+            ? 'Belum Ada Data Kelas di Supabase'
+            : 'Belum Ada Mata Pelajaran untuk Kelas Ini'}
+        </h3>
+        <p className="text-xs text-slate-500 max-w-md mx-auto leading-relaxed">
+          Pastikan data kelas dan mata pelajaran sudah ditambahkan di Supabase melalui menu Master Data &amp; Akun sebelum melakukan olah nilai.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">

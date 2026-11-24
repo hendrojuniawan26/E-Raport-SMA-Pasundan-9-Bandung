@@ -1,12 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  buildInitialGrades,
-  buildInitialHomeroomRecords,
-  INITIAL_CLASSES,
   INITIAL_SCHOOL_SETTINGS,
-  INITIAL_STUDENTS,
-  INITIAL_SUBJECTS,
-  INITIAL_USERS,
 } from '../data/seedData';
 import {
   fetchRecentSupabaseNotifications,
@@ -25,6 +19,12 @@ import {
   testSupabaseConnection,
 } from '../lib/supabase';
 import {
+  fetchSchoolStateFromSupabase,
+  generateUuid,
+  isUuid,
+  syncSchoolDataToSupabase,
+} from '../lib/supabaseSync';
+import {
   ClassRoom,
   ConnectionMode,
   GradeNotification,
@@ -41,7 +41,8 @@ import {
 } from '../types/raport';
 import { recalculateSubjectGrade } from '../utils/gradeCalculator';
 
-const STORAGE_KEY = 'pasundan9_eraport_state_v3';
+const STORAGE_KEY = 'pasundan9_eraport_state_v4';
+const LEGACY_STORAGE_KEY = 'pasundan9_eraport_state_v3';
 const NOTIF_STORAGE_KEY = 'pasundan9_eraport_notifications_v1';
 const READ_NOTIF_IDS_KEY = 'pasundan9_eraport_read_notif_ids_v1';
 
@@ -92,12 +93,19 @@ interface PersistedState {
 function loadInitialState(): PersistedState {
   if (typeof window !== 'undefined') {
     try {
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
       const raw = window.localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as PersistedState;
         if (parsed.settings && Array.isArray(parsed.students) && Array.isArray(parsed.subjects)) {
           return {
             ...parsed,
+            users: Array.isArray(parsed.users) ? parsed.users : [],
+            classes: Array.isArray(parsed.classes) ? parsed.classes : [],
+            subjects: Array.isArray(parsed.subjects) ? parsed.subjects : [],
+            students: Array.isArray(parsed.students) ? parsed.students : [],
+            grades: Array.isArray(parsed.grades) ? parsed.grades : [],
+            homeroomRecords: Array.isArray(parsed.homeroomRecords) ? parsed.homeroomRecords : [],
             settings: {
               ...parsed.settings,
               logoUrl: parsed.settings.logoUrl || INITIAL_SCHOOL_SETTINGS.logoUrl,
@@ -114,12 +122,12 @@ function loadInitialState(): PersistedState {
   }
   return {
     settings: INITIAL_SCHOOL_SETTINGS,
-    users: INITIAL_USERS,
-    classes: INITIAL_CLASSES,
-    subjects: INITIAL_SUBJECTS,
-    students: INITIAL_STUDENTS,
-    grades: buildInitialGrades(),
-    homeroomRecords: buildInitialHomeroomRecords(),
+    users: [],
+    classes: [],
+    subjects: [],
+    students: [],
+    grades: [],
+    homeroomRecords: [],
     gradeSubmissions: [],
   };
 }
@@ -235,7 +243,7 @@ interface AppContextValue {
   lockGrades: (classId: string, subjectId: string) => void;
   unlockGrades: (classId: string, subjectId: string) => void;
   sendGradesToHomeroom: (classId: string, subjectId: string, note?: string) => void;
-  resetDemoData: () => void;
+  syncFromSupabase: () => Promise<{ ok: boolean; message: string }>;
   configureSupabase: (url: string, anonKey: string) => Promise<{ ok: boolean; message: string }>;
   disconnectSupabase: () => Promise<void>;
   // Realtime Notifications for Wali Kelas
@@ -259,7 +267,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [authStatus, setAuthStatus] = useState<AuthSystemStatus>({
     adminClaimed: false,
     envPasscodeConfigured: false,
-    usersCount: INITIAL_USERS.length,
+    usersCount: 0,
     serverReachable: true,
     statusChecked: false,
   });
@@ -267,8 +275,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [guruSubTab, setGuruSubTab] = useState<GuruSubTab>('olah_nilai');
   const [waliSubTab, setWaliSubTab] = useState<WaliSubTab>('absensi');
   const [reportPaperSize, setReportPaperSize] = useState<ReportPaperSize>('A4');
-  const [focusedClassId, setFocusedClassId] = useState<string>('kelas-xi-ipas');
-  const [focusedSubjectId, setFocusedSubjectId] = useState<string>('mapel-informatika');
+  const [focusedClassId, setFocusedClassId] = useState<string>(initial.classes[0]?.id || '');
+  const [focusedSubjectId, setFocusedSubjectId] = useState<string>(initial.subjects[0]?.id || '');
 
   const setActiveTab = (tab: ActiveTab) => {
     if (
@@ -527,6 +535,69 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return {};
   };
 
+  const syncFromSupabaseInternal = async (): Promise<{
+    ok: boolean;
+    message: string;
+    subjects?: Subject[];
+    classes?: ClassRoom[];
+  }> => {
+    const client = getSupabaseClient();
+    if (!client) {
+      return { ok: false, message: 'Koneksi Supabase belum terkonfigurasi.' };
+    }
+    const res = await fetchSchoolStateFromSupabase(client);
+    if (!res.ok || !res.data) {
+      return {
+        ok: false,
+        message: res.error || 'Gagal mengambil data dari Supabase.',
+      };
+    }
+
+    const loaded = res.data;
+    skipNextRemoteSyncRef.current = true;
+    if (loaded.settings) setSettings(loaded.settings);
+    if (loaded.users && loaded.users.length > 0) setUsers(loaded.users);
+    setClasses(loaded.classes);
+    setSubjects(loaded.subjects);
+    setStudents(loaded.students);
+    setGrades(loaded.grades);
+    setHomeroomRecords(loaded.homeroomRecords);
+    setGradeSubmissions(loaded.gradeSubmissions);
+
+    return {
+      ok: true,
+      message: `Data disinkronkan dari Supabase (${loaded.classes.length} kelas, ${loaded.subjects.length} mapel, ${loaded.students.length} siswa).`,
+      subjects: loaded.subjects,
+      classes: loaded.classes,
+    };
+  };
+
+  const syncFromSupabase = async () => {
+    const result = await syncFromSupabaseInternal();
+    if (result.ok) {
+      setSyncStatus('connected');
+      setSupabaseMessage(result.message);
+    }
+    return { ok: result.ok, message: result.message };
+  };
+
+  // Keep focusedClassId and focusedSubjectId valid whenever classes/subjects load from Supabase
+  useEffect(() => {
+    if (classes.length === 0) {
+      if (focusedClassId !== '') setFocusedClassId('');
+    } else if (!classes.some((c) => c.id === focusedClassId)) {
+      setFocusedClassId(classes[0].id);
+    }
+  }, [classes, focusedClassId]);
+
+  useEffect(() => {
+    if (subjects.length === 0) {
+      if (focusedSubjectId !== '') setFocusedSubjectId('');
+    } else if (!subjects.some((s) => s.id === focusedSubjectId)) {
+      setFocusedSubjectId(subjects[0].id);
+    }
+  }, [subjects, focusedSubjectId]);
+
   // Check Auth Status & load shared cross-browser Supabase connectivity on mount
   useEffect(() => {
     refreshAuthStatus();
@@ -556,7 +627,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               .from('profiles')
               .select('*')
               .eq('id', authUser.id)
-              .single();
+              .maybeSingle();
+
+            const sbSync = await syncFromSupabaseInternal();
+
             if (profile) {
               const mapped: AuthUserSummary = {
                 id: profile.id,
@@ -569,8 +643,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 isActive: true,
               };
               setCurrentUser(mapped);
-              applyAuthenticatedFocus(mapped);
+              applyAuthenticatedFocus(mapped, sbSync.subjects, sbSync.classes);
             }
+          } else if (res.ok) {
+            await syncFromSupabaseInternal().catch(() => {});
           }
         }
       }
@@ -801,30 +877,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
 
         const client = getSupabaseClient();
-        if (client && connectionMode === 'supabase') {
-          // Best-effort sync of school settings to Supabase
-          await client.from('school_settings').upsert({
-            id: settings.id,
-            yayasan: settings.yayasan,
-            school_name: settings.schoolName,
-            npsn: settings.npsn,
-            address: settings.address,
-            academic_year: settings.academicYear,
-            semester: settings.semester,
-            principal_name: settings.principalName,
-            principal_nip: settings.principalNip,
-            report_city: settings.reportCity,
-            report_date: settings.reportDate,
-            default_kktp: settings.defaultKktp,
-            threshold_baik: settings.thresholdBaik,
-            weight_sumatif_ppk: settings.weights.sumatifPpk,
-            weight_sumatif_prk: settings.weights.sumatifPrk,
-            weight_sas: settings.weights.sas,
-            weight_kehadiran: settings.weights.kehadiran,
-            weight_proses: settings.weights.proses,
-            weight_tugas: settings.weights.tugas,
-            auto_prk_formula: settings.autoPrkFormula,
+        if (client && connectionMode === 'supabase' && currentUser && !shouldSkipRemoteSync) {
+          await syncSchoolDataToSupabase(client, {
+            role: currentUser.role,
+            settings,
+            classes,
+            subjects,
+            students,
+            grades,
+            homeroomRecords,
+            gradeSubmissions,
           });
+          setSyncStatus('connected');
+        } else if (client && connectionMode === 'supabase') {
           setSyncStatus('connected');
         } else {
           setSyncStatus('saved_local');
@@ -863,39 +928,49 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   const upsertGrade = (grade: SubjectGrade) => {
+    const normalizedGrade: SubjectGrade = {
+      ...grade,
+      id: isUuid(grade.id) ? grade.id : generateUuid(),
+    };
     setGrades((prev) => {
       const idx = prev.findIndex(
-        (g) => g.studentId === grade.studentId && g.subjectId === grade.subjectId
+        (g) => g.studentId === normalizedGrade.studentId && g.subjectId === normalizedGrade.subjectId
       );
       if (idx >= 0) {
         const copy = [...prev];
-        copy[idx] = grade;
+        copy[idx] = normalizedGrade;
         return copy;
       }
-      return [...prev, grade];
+      return [...prev, normalizedGrade];
     });
 
     const client = getSupabaseClient();
-    if (client && connectionMode === 'supabase') {
+    if (
+      client &&
+      connectionMode === 'supabase' &&
+      isUuid(normalizedGrade.studentId) &&
+      isUuid(normalizedGrade.subjectId)
+    ) {
       client
         .from('student_grades')
         .upsert(
           {
-            student_id: grade.studentId,
-            subject_id: grade.subjectId,
-            academic_year: grade.academicYear,
-            semester: grade.semester,
-            tp_scores: grade.tpScores,
-            sas_ppk: grade.sasPpk,
-            sas_prk: grade.sasPrk,
-            kehadiran: grade.kehadiran,
-            proses: grade.proses,
-            tugas: grade.tugas,
-            p3_scores: grade.p3Scores,
-            nilai_akhir: grade.nilaiAkhir,
-            predikat: grade.predikat,
-            deskripsi_auto: grade.deskripsiAuto,
-            deskripsi_manual: grade.deskripsiManual || null,
+            id: normalizedGrade.id,
+            student_id: normalizedGrade.studentId,
+            subject_id: normalizedGrade.subjectId,
+            academic_year: normalizedGrade.academicYear,
+            semester: normalizedGrade.semester,
+            tp_scores: normalizedGrade.tpScores,
+            sas_ppk: normalizedGrade.sasPpk,
+            sas_prk: normalizedGrade.sasPrk,
+            kehadiran: normalizedGrade.kehadiran,
+            proses: normalizedGrade.proses,
+            tugas: normalizedGrade.tugas,
+            p3_scores: normalizedGrade.p3Scores,
+            nilai_akhir: normalizedGrade.nilaiAkhir,
+            predikat: normalizedGrade.predikat,
+            deskripsi_auto: normalizedGrade.deskripsiAuto,
+            deskripsi_manual: normalizedGrade.deskripsiManual || null,
           },
           { onConflict: 'student_id,subject_id,academic_year,semester' }
         )
@@ -1005,14 +1080,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   const upsertHomeroomRecord = (record: HomeroomRecord) => {
+    const normalized: HomeroomRecord = {
+      ...record,
+      id: isUuid(record.id) ? record.id : generateUuid(),
+    };
     setHomeroomRecords((prev) => {
-      const idx = prev.findIndex((r) => r.studentId === record.studentId);
+      const idx = prev.findIndex((r) => r.studentId === normalized.studentId);
       if (idx >= 0) {
         const copy = [...prev];
-        copy[idx] = record;
+        copy[idx] = normalized;
         return copy;
       }
-      return [...prev, record];
+      return [...prev, normalized];
     });
   };
 
@@ -1039,8 +1118,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const lockGrades = (classId: string, subjectId: string) => {
     const now = new Date().toISOString();
-    const id = `${classId}__${subjectId}__${settings.academicYear}__${settings.semester}`;
     const existing = getGradeSubmission(classId, subjectId);
+    const id = existing?.id && isUuid(existing.id) ? existing.id : generateUuid();
     upsertSubmission({
       ...(existing || {}),
       id,
@@ -1057,8 +1136,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const unlockGrades = (classId: string, subjectId: string) => {
     const now = new Date().toISOString();
-    const id = `${classId}__${subjectId}__${settings.academicYear}__${settings.semester}`;
     const existing = getGradeSubmission(classId, subjectId);
+    const id = existing?.id && isUuid(existing.id) ? existing.id : generateUuid();
     upsertSubmission({
       ...(existing || {}),
       id,
@@ -1077,8 +1156,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const sendGradesToHomeroom = (classId: string, subjectId: string, note?: string) => {
     const now = new Date().toISOString();
-    const id = `${classId}__${subjectId}__${settings.academicYear}__${settings.semester}`;
     const existing = getGradeSubmission(classId, subjectId);
+    const id = existing?.id && isUuid(existing.id) ? existing.id : generateUuid();
     upsertSubmission({
       ...(existing || {}),
       id,
@@ -1206,7 +1285,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           setCurrentUser(mapped);
           setConnectionMode('supabase');
           setSyncStatus('connected');
-          applyAuthenticatedFocus(mapped);
+          const sbSync = await syncFromSupabaseInternal();
+          applyAuthenticatedFocus(mapped, sbSync.subjects, sbSync.classes);
           return { ok: true };
         }
         if (error) {
@@ -1262,9 +1342,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         };
       }
       const synced = await loadSchoolStateFromServer(data.token, data.user.role);
+      const sbSync = await syncFromSupabaseInternal();
       setAuthToken(data.token);
       setCurrentUser(data.user);
-      applyAuthenticatedFocus(data.user, synced.subjects, synced.classes);
+      applyAuthenticatedFocus(
+        data.user,
+        sbSync.ok ? sbSync.subjects : synced.subjects,
+        sbSync.ok ? sbSync.classes : synced.classes
+      );
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
     } catch {
@@ -1356,7 +1441,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setCurrentUser(registered);
         setConnectionMode('supabase');
         setSyncStatus('connected');
-        applyAuthenticatedFocus(registered);
+        const sbSync = await syncFromSupabaseInternal();
+        applyAuthenticatedFocus(registered, sbSync.subjects, sbSync.classes);
         return { ok: true };
       } catch {
         return null;
@@ -1433,9 +1519,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, error: data.error || 'Gagal mengklaim akun Admin.' };
       }
       const synced = await loadSchoolStateFromServer(data.token, data.user.role);
+      const sbSync = await syncFromSupabaseInternal();
       setAuthToken(data.token);
       setCurrentUser(data.user);
-      applyAuthenticatedFocus(data.user, synced.subjects, synced.classes);
+      applyAuthenticatedFocus(
+        data.user,
+        sbSync.ok ? sbSync.subjects : synced.subjects,
+        sbSync.ok ? sbSync.classes : synced.classes
+      );
       await refreshAuthStatus();
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
@@ -1592,19 +1683,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setCurrentUser(null);
   };
 
-  const resetDemoData = () => {
-    if (typeof window !== 'undefined') {
-      window.localStorage.removeItem(STORAGE_KEY);
-    }
-    setSettings(INITIAL_SCHOOL_SETTINGS);
-    setUsers(INITIAL_USERS);
-    setClasses(INITIAL_CLASSES);
-    setSubjects(INITIAL_SUBJECTS);
-    setStudents(INITIAL_STUDENTS);
-    setGrades(buildInitialGrades());
-    setHomeroomRecords(buildInitialHomeroomRecords());
-    setGradeSubmissions([]);
-  };
+
 
   const configureSupabase = async (url: string, anonKey: string) => {
     saveRuntimeSupabaseConfig(url, anonKey);
@@ -1623,6 +1702,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (res.ok) {
       setConnectionMode('supabase');
       setSyncStatus('connected');
+      await syncFromSupabaseInternal().catch(() => {});
     } else {
       setConnectionMode('offline');
       setSyncStatus('saved_local');
@@ -1752,7 +1832,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         lockGrades,
         unlockGrades,
         sendGradesToHomeroom,
-        resetDemoData,
+        syncFromSupabase,
         configureSupabase,
         disconnectSupabase,
         notifications: visibleNotifications,

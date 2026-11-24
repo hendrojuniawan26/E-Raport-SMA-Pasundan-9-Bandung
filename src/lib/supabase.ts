@@ -1,7 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-const RUNTIME_URL_KEY = 'pasundan9_supabase_url';
-const RUNTIME_ANON_KEY = 'pasundan9_supabase_anon_key';
+const RUNTIME_URL_KEY = 'https://mqoywabdvqsglzunaegs.supabase.co/';
+const RUNTIME_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1xb3l3YWJkdnFzZ2x6dW5hZWdzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTU0NjQ3MjgsImV4cCI6MjExMTA0MDcyOH0.LKNyOz4BvujaglaTrwSftLJCY6S-6qUYAtJwWdUdpVY';
 
 export type SupabaseConfigSource = 'env' | 'server' | 'local' | 'none';
 

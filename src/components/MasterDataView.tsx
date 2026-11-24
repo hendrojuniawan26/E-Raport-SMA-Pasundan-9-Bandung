@@ -7,6 +7,7 @@ import {
   Image as ImageIcon,
   KeyRound,
   Plus,
+  RefreshCw,
   RotateCcw,
   ShieldCheck,
   Trash2,
@@ -15,9 +16,11 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import {
+  getSupabaseClient,
   getSupabaseConfig,
   uploadAssetToSupabaseOrLocal,
 } from '../lib/supabase';
+import { generateUuid, isUuid } from '../lib/supabaseSync';
 import {
   ClassRoom,
   FaseType,
@@ -227,7 +230,7 @@ export function MasterDataView() {
     deleteUserAccount,
     settings,
     updateSettings,
-    resetDemoData,
+    syncFromSupabase,
     configureSupabase,
     disconnectSupabase,
     supabaseMessage,
@@ -244,7 +247,7 @@ export function MasterDataView() {
     nipNuptk: '',
     nrks: '',
     role: 'guru' as UserRole,
-    assignedClassId: classes[0]?.id || 'kelas-xi-ipas',
+    assignedClassId: classes[0]?.id || '',
     password: '',
   });
   const [accountFeedback, setAccountFeedback] = useState<{
@@ -258,7 +261,7 @@ export function MasterDataView() {
     nisn: '',
     fullName: '',
     gender: 'L' as Gender,
-    classId: classes[0]?.id || 'kelas-xi-ipas',
+    classId: classes[0]?.id || '',
     parentName: '',
   });
   const [newClass, setNewClass] = useState({
@@ -279,6 +282,8 @@ export function MasterDataView() {
   const [sbUrl, setSbUrl] = useState(existingCfg.url);
   const [sbAnon, setSbAnon] = useState(existingCfg.anonKey);
   const [sbTesting, setSbTesting] = useState(false);
+  const [sbSyncing, setSbSyncing] = useState(false);
+  const [sbSyncFeedback, setSbSyncFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [copiedSql, setCopiedSql] = useState(false);
   const [importStatus, setImportStatus] = useState('');
 
@@ -287,6 +292,15 @@ export function MasterDataView() {
     if (latest.url && !sbUrl) setSbUrl(latest.url);
     if (latest.anonKey && !sbAnon) setSbAnon(latest.anonKey);
   }, [supabaseConfigSource]);
+
+  useEffect(() => {
+    if (classes.length > 0) {
+      setNewStudent((prev) => (prev.classId ? prev : { ...prev, classId: classes[0].id }));
+      setNewUser((prev) =>
+        prev.assignedClassId ? prev : { ...prev, assignedClassId: classes[0].id }
+      );
+    }
+  }, [classes]);
 
   const stuImportRef = useRef<HTMLInputElement | null>(null);
   const logoInputRef = useRef<HTMLInputElement | null>(null);
@@ -298,13 +312,18 @@ export function MasterDataView() {
   const handleAddStudent = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newStudent.nis.trim() || !newStudent.fullName.trim()) return;
+    const targetClassId = newStudent.classId || classes[0]?.id || '';
+    if (!targetClassId) {
+      setImportStatus('Tambahkan minimal 1 kelas di tab Kelas & Mapel sebelum menambah siswa.');
+      return;
+    }
     const item: Student = {
-      id: `stu-${Date.now()}`,
+      id: generateUuid(),
       nis: newStudent.nis.trim(),
       nisn: newStudent.nisn.trim(),
       fullName: newStudent.fullName.trim(),
       gender: newStudent.gender,
-      classId: newStudent.classId,
+      classId: targetClassId,
       birthPlace: 'Bandung',
       birthDate: '2008-01-01',
       religion: 'Islam',
@@ -333,14 +352,19 @@ export function MasterDataView() {
   const handleImportStudentsExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (classes.length === 0) {
+      setImportStatus('Tambahkan minimal 1 kelas di tab Kelas & Mapel sebelum mengimpor siswa.');
+      if (stuImportRef.current) stuImportRef.current.value = '';
+      return;
+    }
     try {
       const rows = await parseMasterStudentsExcel(file);
-      const next: Student[] = rows.map((r, i) => {
+      const next: Student[] = rows.map((r) => {
         const matchedClass =
           classes.find((c) => c.name.toLowerCase() === r.className.toLowerCase()) ||
           classes[0];
         return {
-          id: `stu-imp-${Date.now()}-${i}`,
+          id: generateUuid(),
           nis: r.nis,
           nisn: r.nisn,
           fullName: r.fullName,
@@ -367,7 +391,7 @@ export function MasterDataView() {
     e.preventDefault();
     if (!newClass.name.trim()) return;
     const item: ClassRoom = {
-      id: `kelas-${Date.now()}`,
+      id: generateUuid(),
       name: newClass.name.trim(),
       gradeLevel: newClass.gradeLevel,
       fase: newClass.gradeLevel === 10 ? 'E' : 'F',
@@ -380,7 +404,7 @@ export function MasterDataView() {
   const handleAddSubject = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newSubject.code.trim() || !newSubject.name.trim()) return;
-    const id = `mapel-${Date.now()}`;
+    const id = generateUuid();
     const item: Subject = {
       id,
       code: newSubject.code.trim().toUpperCase(),
@@ -392,10 +416,10 @@ export function MasterDataView() {
       sortOrder: subjects.length + 1,
       sasTitle: `Evaluasi Akhir ${newSubject.name.trim()}`,
       tpList: [
-        { id: `${id}-tp-1`, code: 'Sumatif 1', title: 'memahami konsep dasar materi' },
-        { id: `${id}-tp-2`, code: 'Sumatif 2', title: 'menganalisis penerapan materi' },
-        { id: `${id}-tp-3`, code: 'Sumatif 3', title: 'mempraktikkan proyek pembelajaran' },
-        { id: `${id}-tp-4`, code: 'Sumatif 4', title: 'mengevaluasi studi kasus' },
+        { id: generateUuid(), code: 'Sumatif 1', title: 'memahami konsep dasar materi' },
+        { id: generateUuid(), code: 'Sumatif 2', title: 'menganalisis penerapan materi' },
+        { id: generateUuid(), code: 'Sumatif 3', title: 'mempraktikkan proyek pembelajaran' },
+        { id: generateUuid(), code: 'Sumatif 4', title: 'mengevaluasi studi kasus' },
       ],
     };
     setSubjects((prev) => [...prev, item]);
@@ -453,7 +477,7 @@ export function MasterDataView() {
         nipNuptk: '',
         nrks: '',
         role: 'guru',
-        assignedClassId: classes[0]?.id || 'kelas-xi-ipas',
+        assignedClassId: classes[0]?.id || '',
         password: '',
       });
     } else {
@@ -507,13 +531,38 @@ export function MasterDataView() {
 
         <button
           type="button"
-          onClick={resetDemoData}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-600 hover:text-red-700 border border-slate-200 hover:border-red-200 rounded-xl transition-colors whitespace-nowrap shrink-0"
+          disabled={sbSyncing}
+          onClick={async () => {
+            setSbSyncing(true);
+            const res = await syncFromSupabase();
+            setSbSyncFeedback({ ok: res.ok, text: res.message });
+            setSbSyncing(false);
+          }}
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-xl transition-colors whitespace-nowrap shrink-0 disabled:opacity-60"
         >
-          <RotateCcw className="w-3.5 h-3.5" />
-          <span>Reset Data Awal CSV</span>
+          <RefreshCw className={`w-3.5 h-3.5 ${sbSyncing ? 'animate-spin' : ''}`} />
+          <span>{sbSyncing ? 'Menyinkronkan...' : 'Muat Ulang dari Supabase'}</span>
         </button>
       </div>
+
+      {sbSyncFeedback && (
+        <div
+          className={`p-3 rounded-xl border text-xs flex items-center justify-between gap-3 ${
+            sbSyncFeedback.ok
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : 'bg-amber-50 border-amber-200 text-amber-900'
+          }`}
+        >
+          <span>{sbSyncFeedback.text}</span>
+          <button
+            type="button"
+            onClick={() => setSbSyncFeedback(null)}
+            className="underline shrink-0"
+          >
+            Tutup
+          </button>
+        </div>
+      )}
 
       {/* TAB 1: DATA SISWA */}
       {tab === 'siswa' && (
@@ -607,11 +656,15 @@ export function MasterDataView() {
                 }
                 className="sm:col-span-2 px-2.5 py-2 text-xs border border-slate-200 rounded-lg bg-white"
               >
-                {classes.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
+                {classes.length === 0 ? (
+                  <option value="">Belum ada kelas</option>
+                ) : (
+                  classes.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))
+                )}
               </select>
               <button
                 type="submit"
@@ -655,61 +708,73 @@ export function MasterDataView() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {visibleStudents.map((stu) => {
-                    const cls = classes.find((c) => c.id === stu.classId);
-                    return (
-                      <tr key={stu.id} className="hover:bg-slate-50/70">
-                        <td className="py-2 px-3 text-center">
-                          <label className="cursor-pointer inline-flex items-center justify-center w-8 h-8 rounded-full bg-slate-100 border border-slate-200 overflow-hidden hover:border-emerald-600">
-                            {stu.photoUrl ? (
-                              <img
-                                src={stu.photoUrl}
-                                alt={stu.fullName}
-                                referrerPolicy="no-referrer"
-                                className="w-full h-full object-cover"
+                  {visibleStudents.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-10 px-4 text-center text-xs text-slate-500">
+                        Belum ada data peserta didik di Supabase. Tambahkan siswa melalui form di atas atau impor file Excel.
+                      </td>
+                    </tr>
+                  ) : (
+                    visibleStudents.map((stu) => {
+                      const cls = classes.find((c) => c.id === stu.classId);
+                      return (
+                        <tr key={stu.id} className="hover:bg-slate-50/70">
+                          <td className="py-2 px-3 text-center">
+                            <label className="cursor-pointer inline-flex items-center justify-center w-8 h-8 rounded-full bg-slate-100 border border-slate-200 overflow-hidden hover:border-emerald-600">
+                              {stu.photoUrl ? (
+                                <img
+                                  src={stu.photoUrl}
+                                  alt={stu.fullName}
+                                  referrerPolicy="no-referrer"
+                                  className="w-full h-full object-cover"
+                                />
+                              ) : (
+                                <ImageIcon className="w-3.5 h-3.5 text-slate-400" />
+                              )}
+                              <input
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={(e) =>
+                                  handleStudentPhotoUpload(stu.id, e.target.files?.[0])
+                                }
                               />
-                            ) : (
-                              <ImageIcon className="w-3.5 h-3.5 text-slate-400" />
-                            )}
-                            <input
-                              type="file"
-                              accept="image/*"
-                              className="hidden"
-                              onChange={(e) =>
-                                handleStudentPhotoUpload(stu.id, e.target.files?.[0])
-                              }
-                            />
-                          </label>
-                        </td>
-                        <td className="py-2.5 px-3 font-mono tabular-nums">
-                          <div className="font-semibold text-slate-900">{stu.nis}</div>
-                          <div className="text-[10px] text-slate-500">
-                            {stu.nisn || '-'}
-                          </div>
-                        </td>
-                        <td className="py-2.5 px-3 font-medium text-slate-900">
-                          {stu.fullName}
-                        </td>
-                        <td className="py-2.5 px-3 text-center">{stu.gender}</td>
-                        <td className="py-2.5 px-3">
-                          {cls?.name} · Fase {cls?.fase}
-                        </td>
-                        <td className="py-2.5 px-3 text-slate-600">{stu.parentName}</td>
-                        <td className="py-2.5 px-3 text-right">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setStudents((prev) => prev.filter((s) => s.id !== stu.id))
-                            }
-                            className="p-1.5 text-slate-400 hover:text-red-600"
-                            title="Hapus siswa"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                            </label>
+                          </td>
+                          <td className="py-2.5 px-3 font-mono tabular-nums">
+                            <div className="font-semibold text-slate-900">{stu.nis}</div>
+                            <div className="text-[10px] text-slate-500">
+                              {stu.nisn || '-'}
+                            </div>
+                          </td>
+                          <td className="py-2.5 px-3 font-medium text-slate-900">
+                            {stu.fullName}
+                          </td>
+                          <td className="py-2.5 px-3 text-center">{stu.gender}</td>
+                          <td className="py-2.5 px-3">
+                            {cls ? `${cls.name} · Fase ${cls.fase}` : 'Kelas belum ditetapkan'}
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-600">{stu.parentName}</td>
+                          <td className="py-2.5 px-3 text-right">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setStudents((prev) => prev.filter((s) => s.id !== stu.id));
+                                const client = getSupabaseClient();
+                                if (client && isUuid(stu.id)) {
+                                  client.from('students').delete().eq('id', stu.id).then(() => {});
+                                }
+                              }}
+                              className="p-1.5 text-slate-400 hover:text-red-600"
+                              title="Hapus siswa"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
@@ -758,44 +823,66 @@ export function MasterDataView() {
             </form>
 
             <div className="divide-y divide-slate-100">
-              {classes.map((cls) => {
-                const wali = users.find((u) => u.id === cls.homeroomTeacherId);
-                return (
-                  <div
-                    key={cls.id}
-                    className="py-3 flex items-center justify-between gap-3 text-xs"
-                  >
-                    <div>
-                      <div className="font-semibold text-slate-900">
-                        {cls.name} · Fase {cls.fase}
+              {classes.length === 0 ? (
+                <p className="py-6 text-center text-xs text-slate-500">
+                  Belum ada data kelas di Supabase. Tambahkan kelas baru di atas.
+                </p>
+              ) : (
+                classes.map((cls) => {
+                  const wali = users.find((u) => u.id === cls.homeroomTeacherId);
+                  return (
+                    <div
+                      key={cls.id}
+                      className="py-3 flex items-center justify-between gap-3 text-xs"
+                    >
+                      <div>
+                        <div className="font-semibold text-slate-900">
+                          {cls.name} · Fase {cls.fase}
+                        </div>
+                        <div className="text-slate-500">
+                          Wali: {wali?.fullName || 'Belum ditentukan'}
+                        </div>
                       </div>
-                      <div className="text-slate-500">
-                        Wali: {wali?.fullName || 'Belum ditentukan'}
+                      <div className="flex items-center gap-1.5">
+                        <select
+                          value={cls.homeroomTeacherId || ''}
+                          onChange={(e) =>
+                            setClasses((prev) =>
+                              prev.map((c) =>
+                                c.id === cls.id
+                                  ? { ...c, homeroomTeacherId: e.target.value || undefined }
+                                  : c
+                              )
+                            )
+                          }
+                          className="px-2 py-1 text-xs border border-slate-200 rounded-md bg-white max-w-[150px]"
+                        >
+                          <option value="">Pilih Wali Kelas</option>
+                          {users.map((u) => (
+                            <option key={u.id} value={u.id}>
+                              {u.fullName}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setClasses((prev) => prev.filter((c) => c.id !== cls.id));
+                            const client = getSupabaseClient();
+                            if (client && isUuid(cls.id)) {
+                              client.from('classes').delete().eq('id', cls.id).then(() => {});
+                            }
+                          }}
+                          className="p-1.5 text-slate-400 hover:text-red-600"
+                          title="Hapus kelas"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
                     </div>
-                    <select
-                      value={cls.homeroomTeacherId || ''}
-                      onChange={(e) =>
-                        setClasses((prev) =>
-                          prev.map((c) =>
-                            c.id === cls.id
-                              ? { ...c, homeroomTeacherId: e.target.value }
-                              : c
-                          )
-                        )
-                      }
-                      className="px-2 py-1 text-xs border border-slate-200 rounded-md bg-white max-w-[160px]"
-                    >
-                      <option value="">Pilih Wali Kelas</option>
-                      {users.map((u) => (
-                        <option key={u.id} value={u.id}>
-                          {u.fullName}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                );
-              })}
+                  );
+                })
+              )}
             </div>
           </div>
 
@@ -873,46 +960,66 @@ export function MasterDataView() {
             </form>
 
             <div className="divide-y divide-slate-100 max-h-[520px] overflow-y-auto pr-1">
-              {subjects.map((sub) => (
-                <div
-                  key={sub.id}
-                  className="py-2.5 flex items-center justify-between gap-3 text-xs"
-                >
-                  <div>
-                    <div className="font-semibold text-slate-900">
-                      {sub.name} ({sub.code})
+              {subjects.length === 0 ? (
+                <p className="py-6 text-center text-xs text-slate-500">
+                  Belum ada data mata pelajaran di Supabase. Tambahkan mata pelajaran baru di atas.
+                </p>
+              ) : (
+                subjects.map((sub) => (
+                  <div
+                    key={sub.id}
+                    className="py-2.5 flex items-center justify-between gap-3 text-xs"
+                  >
+                    <div>
+                      <div className="font-semibold text-slate-900">
+                        {sub.name} ({sub.code})
+                      </div>
+                      <div className="text-slate-500">
+                        Kelompok {sub.category} ·{' '}
+                        {sub.faseScope === 'ALL'
+                          ? 'Fase E & F'
+                          : sub.faseScope === 'E'
+                            ? 'Khusus Fase E (Kelas X)'
+                            : 'Khusus Fase F (Kelas XI/XII)'}{' '}
+                        · Guru: {sub.teacherName || '-'}
+                      </div>
                     </div>
-                    <div className="text-slate-500">
-                      Kelompok {sub.category} ·{' '}
-                      {sub.faseScope === 'ALL'
-                        ? 'Fase E & F'
-                        : sub.faseScope === 'E'
-                          ? 'Khusus Fase E (Kelas X)'
-                          : 'Khusus Fase F (Kelas XI/XII)'}{' '}
-                      · Guru: {sub.teacherName || '-'}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <label className="text-[11px] text-slate-500">KKTP</label>
-                    <input
-                      type="number"
-                      min={0}
-                      max={100}
-                      value={sub.kktp}
-                      onChange={(e) =>
-                        setSubjects((prev) =>
-                          prev.map((s) =>
-                            s.id === sub.id
-                              ? { ...s, kktp: Number(e.target.value) || 70 }
-                              : s
+                    <div className="flex items-center gap-2">
+                      <label className="text-[11px] text-slate-500">KKTP</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        value={sub.kktp}
+                        onChange={(e) =>
+                          setSubjects((prev) =>
+                            prev.map((s) =>
+                              s.id === sub.id
+                                ? { ...s, kktp: Number(e.target.value) || 70 }
+                                : s
+                            )
                           )
-                        )
-                      }
-                      className="w-14 px-2 py-1 text-center font-mono border border-slate-200 rounded-md"
-                    />
+                        }
+                        className="w-14 px-2 py-1 text-center font-mono border border-slate-200 rounded-md"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSubjects((prev) => prev.filter((s) => s.id !== sub.id));
+                          const client = getSupabaseClient();
+                          if (client && isUuid(sub.id)) {
+                            client.from('subjects').delete().eq('id', sub.id).then(() => {});
+                          }
+                        }}
+                        className="p-1.5 text-slate-400 hover:text-red-600"
+                        title="Hapus mata pelajaran"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))
+              )}
             </div>
           </div>
         </div>

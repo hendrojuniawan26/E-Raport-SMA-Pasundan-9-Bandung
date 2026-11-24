@@ -12,6 +12,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useApp, WaliSubTab } from '../context/AppContext';
+import { generateUuid } from '../lib/supabaseSync';
 import {
   ExtracurricularItem,
   HomeroomRecord,
@@ -41,20 +42,25 @@ export function HomeroomView() {
     unlockGrades,
   } = useApp();
 
-  const [selectedStudentId, setSelectedStudentId] = useState<string>('stu-1');
+  const [selectedStudentId, setSelectedStudentId] = useState<string>('');
   const [returnMsg, setReturnMsg] = useState('');
 
   const selectedClass = classes.find((c) => c.id === focusedClassId) || classes[0];
   const classStudents = useMemo(
-    () => students.filter((s) => s.classId === selectedClass.id && s.isActive),
-    [students, selectedClass.id]
+    () =>
+      selectedClass
+        ? students.filter((s) => s.classId === selectedClass.id && s.isActive)
+        : [],
+    [students, selectedClass]
   );
 
   const classSubjects = useMemo(
     () =>
-      subjects
-        .filter((sub) => isSubjectForClass(sub, selectedClass))
-        .sort((a, b) => a.sortOrder - b.sortOrder),
+      selectedClass
+        ? subjects
+            .filter((sub) => isSubjectForClass(sub, selectedClass))
+            .sort((a, b) => a.sortOrder - b.sortOrder)
+        : [],
     [subjects, selectedClass]
   );
 
@@ -65,7 +71,7 @@ export function HomeroomView() {
     const found = homeroomRecords.find((h) => h.studentId === studentId);
     if (found) return found;
     return {
-      id: `hr-${studentId}`,
+      id: generateUuid(),
       studentId,
       academicYear: settings.academicYear,
       semester: settings.semester,
@@ -147,6 +153,7 @@ export function HomeroomView() {
   }, [classStudents, classSubjects, grades, homeroomRecords, settings]);
 
   const incomingSubjects = useMemo(() => {
+    if (!selectedClass) return [];
     return classSubjects.map((sub) => {
       const submission = getGradeSubmission(selectedClass.id, sub.id);
       const subGrades = classStudents
@@ -170,7 +177,7 @@ export function HomeroomView() {
         avg,
       };
     });
-  }, [classSubjects, classStudents, grades, settings, selectedClass.id, getGradeSubmission]);
+  }, [classSubjects, classStudents, grades, settings, selectedClass, getGradeSubmission]);
 
   const sentCount = incomingSubjects.filter((item) => item.status === 'sent').length;
 
@@ -187,6 +194,20 @@ export function HomeroomView() {
       return '';
     }
   };
+
+  if (!selectedClass) {
+    return (
+      <div className="bg-white border border-slate-200/90 rounded-2xl p-10 text-center space-y-2.5">
+        <FileSpreadsheet className="w-8 h-8 text-slate-400 mx-auto" />
+        <div className="text-sm font-semibold text-slate-900">
+          Belum Ada Data Kelas di Supabase
+        </div>
+        <p className="text-xs text-slate-500 max-w-md mx-auto">
+          Tambahkan kelas dan peserta didik melalui menu Master Data agar modul Wali Kelas (Absensi, Ekskul, P5, dan Leger) dapat digunakan.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">
