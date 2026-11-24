@@ -187,6 +187,10 @@ CREATE TABLE IF NOT EXISTS public.grade_notifications (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
+GRANT SELECT, INSERT ON public.grade_notifications TO anon, authenticated;
+
 ALTER TABLE public.grade_notifications ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Grade notifications readable by staff" ON public.grade_notifications;
 DROP POLICY IF EXISTS "Grade notifications readable" ON public.grade_notifications;

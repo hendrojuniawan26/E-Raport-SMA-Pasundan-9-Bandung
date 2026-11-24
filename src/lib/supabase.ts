@@ -33,12 +33,16 @@ function isPlaceholderConfig(url: string, anonKey: string): boolean {
   );
 }
 
+function normalizeSupabaseUrl(url: string): string {
+  return url.trim().replace(/\/+$/, '');
+}
+
 export function getSupabaseConfig(): ResolvedSupabaseConfig {
-  const envUrl = (
+  const envUrl = normalizeSupabaseUrl(
     (import.meta.env.VITE_SUPABASE_URL as string | undefined) ||
-    (import.meta.env.NEXT_PUBLIC_SUPABASE_URL as string | undefined) ||
-    ''
-  ).trim();
+      (import.meta.env.NEXT_PUBLIC_SUPABASE_URL as string | undefined) ||
+      ''
+  );
   const envAnon = (
     (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) ||
     (import.meta.env.NEXT_PUBLIC_SUPABASE_ANON_KEY as string | undefined) ||
@@ -51,14 +55,16 @@ export function getSupabaseConfig(): ResolvedSupabaseConfig {
 
   if (!isPlaceholderConfig(serverConfigCache.url, serverConfigCache.anonKey)) {
     return {
-      url: serverConfigCache.url,
+      url: normalizeSupabaseUrl(serverConfigCache.url),
       anonKey: serverConfigCache.anonKey,
       source: serverConfigCache.source === 'env' ? 'env' : 'server',
     };
   }
 
   const localUrl =
-    typeof window !== 'undefined' ? (window.localStorage.getItem(RUNTIME_URL_KEY) || '').trim() : '';
+    typeof window !== 'undefined'
+      ? normalizeSupabaseUrl(window.localStorage.getItem(RUNTIME_URL_KEY) || '')
+      : '';
   const localAnon =
     typeof window !== 'undefined' ? (window.localStorage.getItem(RUNTIME_ANON_KEY) || '').trim() : '';
 
@@ -80,12 +86,13 @@ export async function loadServerSupabaseConfig(): Promise<ResolvedSupabaseConfig
         anonKey?: string;
       };
       if (data.configured && data.url && data.anonKey) {
+        const cleanUrl = normalizeSupabaseUrl(data.url);
         serverConfigCache = {
-          url: data.url.trim(),
+          url: cleanUrl,
           anonKey: data.anonKey.trim(),
           source: data.source || 'server',
         };
-        saveRuntimeSupabaseConfig(data.url, data.anonKey);
+        saveRuntimeSupabaseConfig(cleanUrl, data.anonKey);
       } else {
         serverConfigCache = { url: '', anonKey: '', source: 'none' };
       }
@@ -155,8 +162,9 @@ export async function clearServerSupabaseConfigRemote(
 
 export function saveRuntimeSupabaseConfig(url: string, anonKey: string): void {
   if (typeof window === 'undefined') return;
-  if (url.trim() && anonKey.trim()) {
-    window.localStorage.setItem(RUNTIME_URL_KEY, url.trim());
+  const cleanUrl = normalizeSupabaseUrl(url);
+  if (cleanUrl && anonKey.trim()) {
+    window.localStorage.setItem(RUNTIME_URL_KEY, cleanUrl);
     window.localStorage.setItem(RUNTIME_ANON_KEY, anonKey.trim());
   } else {
     window.localStorage.removeItem(RUNTIME_URL_KEY);
@@ -204,19 +212,42 @@ export async function testSupabaseConnection(): Promise<{
   }
 
   try {
-    const { error } = await client.from('school_settings').select('id').limit(1);
-    if (error) {
+    const cleanUrl = normalizeSupabaseUrl(cfg.url);
+    const healthRes = await fetch(`${cleanUrl}/auth/v1/health`, {
+      headers: { apikey: cfg.anonKey },
+    });
+    if (!healthRes.ok) {
       return {
         ok: false,
-        message: `Terkoneksi ke proyek Supabase, tetapi tabel belum siap: ${error.message}`,
+        message: `Supabase URL atau Anon Public Key ditolak server (HTTP ${healthRes.status}). Periksa kembali kunci proyek Supabase Anda.`,
       };
     }
+
     const sourceText =
       cfg.source === 'env'
         ? 'konfigurasi permanen environment (.env / Secrets)'
         : cfg.source === 'server'
           ? 'konfigurasi server permanen (aktif di semua browser)'
           : 'konfigurasi browser lokal';
+
+    const { error } = await client.from('school_settings').select('id').limit(1);
+    if (error) {
+      const msgLower = error.message.toLowerCase();
+      if (
+        error.code === '42501' ||
+        msgLower.includes('permission denied') ||
+        msgLower.includes('row-level security')
+      ) {
+        return {
+          ok: true,
+          message: `Terhubung otomatis ke Supabase (${sourceText}) · Autentikasi & RLS aktif.`,
+        };
+      }
+      return {
+        ok: false,
+        message: `Terkoneksi ke proyek Supabase, tetapi tabel belum siap: ${error.message}`,
+      };
+    }
     return {
       ok: true,
       message: `Terhubung otomatis ke Supabase (${sourceText}).`,

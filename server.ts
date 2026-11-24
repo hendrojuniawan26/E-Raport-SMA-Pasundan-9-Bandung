@@ -157,13 +157,17 @@ function isValidSupabaseUrl(rawUrl: string): boolean {
   }
 }
 
+function normalizeSupabaseUrl(rawUrl: string): string {
+  return rawUrl.trim().replace(/\/+$/, '');
+}
+
 function getEnvSupabaseConfig(): StoredSupabaseConfig {
-  const url = (
+  const url = normalizeSupabaseUrl(
     process.env.VITE_SUPABASE_URL ||
-    process.env.SUPABASE_URL ||
-    process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    ''
-  ).trim();
+      process.env.SUPABASE_URL ||
+      process.env.NEXT_PUBLIC_SUPABASE_URL ||
+      ''
+  );
   const anonKey = (
     process.env.VITE_SUPABASE_ANON_KEY ||
     process.env.SUPABASE_ANON_KEY ||
@@ -190,7 +194,7 @@ function loadSavedSupabaseConfig(): StoredSupabaseConfig {
   try {
     const raw = fs.readFileSync(SUPABASE_CONFIG_FILE, 'utf8');
     const parsed = JSON.parse(raw) as Partial<StoredSupabaseConfig>;
-    const url = typeof parsed.url === 'string' ? parsed.url.trim() : '';
+    const url = typeof parsed.url === 'string' ? normalizeSupabaseUrl(parsed.url) : '';
     const anonKey = typeof parsed.anonKey === 'string' ? parsed.anonKey.trim() : '';
     if (!url || !anonKey || !isValidSupabaseUrl(url)) {
       return { url: '', anonKey: '' };
@@ -204,7 +208,7 @@ function loadSavedSupabaseConfig(): StoredSupabaseConfig {
 function saveServerSupabaseConfig(url: string, anonKey: string): StoredSupabaseConfig {
   ensureDataDir();
   const payload: StoredSupabaseConfig = {
-    url: url.trim(),
+    url: normalizeSupabaseUrl(url),
     anonKey: anonKey.trim(),
     updatedAt: new Date().toISOString(),
   };

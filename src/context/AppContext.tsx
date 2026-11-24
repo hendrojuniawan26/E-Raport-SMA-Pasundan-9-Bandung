@@ -1131,72 +1131,77 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       try {
         const { data, error } = await client.auth.signInWithPassword({ email, password });
         if (!error && data.user) {
-          const { data: profile } = await client
-            .from('profiles')
-            .select('*')
-            .eq('id', data.user.id)
-            .maybeSingle();
-
           const meta = (data.user.user_metadata || {}) as Record<string, unknown>;
           const safeMetaRole: UserRole =
             meta.role === 'wali_kelas' ? 'wali_kelas' : 'guru';
 
-          let activeProfile = profile;
-          if (!activeProfile) {
-            const fullName =
-              typeof meta.full_name === 'string' && meta.full_name.trim()
-                ? meta.full_name.trim()
-                : email.split('@')[0];
-            const nipNuptk =
-              typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk.trim() : '';
-            const { data: inserted } = await client
+          let activeProfile: Record<string, unknown> | null = null;
+          try {
+            const { data: profile } = await client
               .from('profiles')
-              .upsert(
-                {
-                  id: data.user.id,
-                  email: data.user.email || email.trim().toLowerCase(),
-                  full_name: fullName,
-                  nip_nuptk: nipNuptk,
-                  role: safeMetaRole,
-                },
-                { onConflict: 'id' }
-              )
               .select('*')
+              .eq('id', data.user.id)
               .maybeSingle();
-            activeProfile = inserted;
+            activeProfile = (profile as Record<string, unknown> | null) || null;
+
+            if (!activeProfile) {
+              const fullName =
+                typeof meta.full_name === 'string' && meta.full_name.trim()
+                  ? meta.full_name.trim()
+                  : email.split('@')[0];
+              const nipNuptk =
+                typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk.trim() : '';
+              const { data: inserted } = await client
+                .from('profiles')
+                .upsert(
+                  {
+                    id: data.user.id,
+                    email: data.user.email || email.trim().toLowerCase(),
+                    full_name: fullName,
+                    nip_nuptk: nipNuptk,
+                    role: safeMetaRole,
+                  },
+                  { onConflict: 'id' }
+                )
+                .select('*')
+                .maybeSingle();
+              activeProfile = (inserted as Record<string, unknown> | null) || null;
+            }
+          } catch {
+            // Keep login succeeding with auth metadata if profiles table isn't ready
           }
 
-          const mapped: AuthUserSummary = activeProfile
-            ? {
-                id: activeProfile.id,
-                email: activeProfile.email,
-                fullName: activeProfile.full_name,
-                nipNuptk: activeProfile.nip_nuptk || '',
-                nrks: activeProfile.nrks || '',
-                role: activeProfile.role,
-                avatarUrl: activeProfile.avatar_url || undefined,
-                assignedClassId:
-                  typeof meta.assigned_class_id === 'string'
-                    ? meta.assigned_class_id
-                    : undefined,
-                isActive: true,
-              }
-            : {
-                id: data.user.id,
-                email: data.user.email || email.trim().toLowerCase(),
-                fullName:
-                  typeof meta.full_name === 'string' && meta.full_name.trim()
-                    ? meta.full_name.trim()
-                    : email.split('@')[0],
-                nipNuptk: typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk : '',
-                nrks: '',
-                role: safeMetaRole,
-                assignedClassId:
-                  typeof meta.assigned_class_id === 'string'
-                    ? meta.assigned_class_id
-                    : undefined,
-                isActive: true,
-              };
+          const profileRole = activeProfile?.role;
+          const resolvedRole: UserRole =
+            profileRole === 'admin' || profileRole === 'wali_kelas' || profileRole === 'guru'
+              ? profileRole
+              : safeMetaRole;
+
+          const mapped: AuthUserSummary = {
+            id: data.user.id,
+            email:
+              (typeof activeProfile?.email === 'string' && activeProfile.email) ||
+              data.user.email ||
+              email.trim().toLowerCase(),
+            fullName:
+              (typeof activeProfile?.full_name === 'string' && activeProfile.full_name) ||
+              (typeof meta.full_name === 'string' && meta.full_name.trim()) ||
+              email.split('@')[0],
+            nipNuptk:
+              (typeof activeProfile?.nip_nuptk === 'string' && activeProfile.nip_nuptk) ||
+              (typeof meta.nip_nuptk === 'string' ? meta.nip_nuptk : ''),
+            nrks: typeof activeProfile?.nrks === 'string' ? activeProfile.nrks : '',
+            role: resolvedRole,
+            avatarUrl:
+              typeof activeProfile?.avatar_url === 'string'
+                ? activeProfile.avatar_url
+                : undefined,
+            assignedClassId:
+              typeof meta.assigned_class_id === 'string'
+                ? meta.assigned_class_id
+                : undefined,
+            isActive: true,
+          };
 
           setCurrentUser(mapped);
           setConnectionMode('supabase');
@@ -1207,8 +1212,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (error) {
           supabaseErrorMessage = error.message;
         }
-      } catch {
-        // fall through to backend auth
+      } catch (err) {
+        supabaseErrorMessage =
+          err instanceof Error ? err.message : 'Gagal menghubungi server Supabase Auth.';
       }
     }
 
@@ -1225,17 +1231,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         error?: string;
       }>(res);
       if (parsed.rawError) {
-        if (client && supabaseErrorMessage) {
-          if (supabaseErrorMessage.toLowerCase().includes('email not confirmed')) {
+        if (client) {
+          const lower = supabaseErrorMessage.toLowerCase();
+          if (lower.includes('email not confirmed')) {
             return {
               ok: false,
-              error: 'Email belum dikonfirmasi di Supabase. Cek inbox email Anda terlebih dahulu.',
+              error:
+                'Email belum dikonfirmasi di Supabase. Cek inbox email Anda atau aktifkan Auto Confirm User di Supabase Authentication.',
+            };
+          }
+          if (lower.includes('invalid login credentials') || !supabaseErrorMessage) {
+            return {
+              ok: false,
+              error:
+                'Email atau kata sandi belum terdaftar di Supabase Auth (atau tidak cocok). Untuk Guru/Wali silakan daftar di tab "Daftar Guru / Wali"; untuk Admin pastikan akun sudah dibuat di Supabase Authentication → Users.',
             };
           }
           return {
             ok: false,
-            error:
-              'Email atau kata sandi belum terdaftar di Supabase Auth. Gunakan tab "Daftar Guru / Wali" atau buat akun di Supabase Authentication.',
+            error: `Gagal login melalui Supabase Auth: ${supabaseErrorMessage}`,
           };
         }
         return { ok: false, error: parsed.rawError };
@@ -1254,10 +1268,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
     } catch {
-      if (client && supabaseErrorMessage) {
+      if (client) {
         return {
           ok: false,
-          error: 'Email atau kata sandi tidak sesuai di Supabase Auth.',
+          error: supabaseErrorMessage
+            ? `Gagal login melalui Supabase Auth: ${supabaseErrorMessage}`
+            : 'Email atau kata sandi belum terdaftar di Supabase Auth (atau tidak cocok).',
         };
       }
       return {

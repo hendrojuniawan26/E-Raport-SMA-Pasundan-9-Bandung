@@ -241,6 +241,10 @@ ALTER TABLE public.homeroom_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.grade_submissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.grade_notifications ENABLE ROW LEVEL SECURITY;
 
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
+GRANT SELECT, INSERT ON public.grade_notifications TO anon, authenticated;
+
 -- Helper function cek role user aktif
 CREATE OR REPLACE FUNCTION public.get_my_role()
 RETURNS public.user_role
