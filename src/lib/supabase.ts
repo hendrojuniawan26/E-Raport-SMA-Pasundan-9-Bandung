@@ -1,0 +1,257 @@
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+
+const RUNTIME_URL_KEY = 'pasundan9_supabase_url';
+const RUNTIME_ANON_KEY = 'pasundan9_supabase_anon_key';
+
+export type SupabaseConfigSource = 'env' | 'server' | 'local' | 'none';
+
+export interface ResolvedSupabaseConfig {
+  url: string;
+  anonKey: string;
+  source: SupabaseConfigSource;
+}
+
+let serverConfigCache: {
+  url: string;
+  anonKey: string;
+  source: 'env' | 'server' | 'none';
+} = {
+  url: '',
+  anonKey: '',
+  source: 'none',
+};
+
+let cachedClient: SupabaseClient | null = null;
+let cachedClientSignature = '';
+
+function isPlaceholderConfig(url: string, anonKey: string): boolean {
+  return (
+    !url ||
+    !anonKey ||
+    url.includes('your-project-id') ||
+    anonKey.includes('your-supabase-anon-key')
+  );
+}
+
+export function getSupabaseConfig(): ResolvedSupabaseConfig {
+  const envUrl = (
+    (import.meta.env.VITE_SUPABASE_URL as string | undefined) ||
+    (import.meta.env.NEXT_PUBLIC_SUPABASE_URL as string | undefined) ||
+    ''
+  ).trim();
+  const envAnon = (
+    (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) ||
+    (import.meta.env.NEXT_PUBLIC_SUPABASE_ANON_KEY as string | undefined) ||
+    ''
+  ).trim();
+
+  if (!isPlaceholderConfig(envUrl, envAnon)) {
+    return { url: envUrl, anonKey: envAnon, source: 'env' };
+  }
+
+  if (!isPlaceholderConfig(serverConfigCache.url, serverConfigCache.anonKey)) {
+    return {
+      url: serverConfigCache.url,
+      anonKey: serverConfigCache.anonKey,
+      source: serverConfigCache.source === 'env' ? 'env' : 'server',
+    };
+  }
+
+  const localUrl =
+    typeof window !== 'undefined' ? (window.localStorage.getItem(RUNTIME_URL_KEY) || '').trim() : '';
+  const localAnon =
+    typeof window !== 'undefined' ? (window.localStorage.getItem(RUNTIME_ANON_KEY) || '').trim() : '';
+
+  if (!isPlaceholderConfig(localUrl, localAnon)) {
+    return { url: localUrl, anonKey: localAnon, source: 'local' };
+  }
+
+  return { url: '', anonKey: '', source: 'none' };
+}
+
+export async function loadServerSupabaseConfig(): Promise<ResolvedSupabaseConfig> {
+  try {
+    const res = await fetch('/api/config/supabase');
+    if (res.ok) {
+      const data = (await res.json()) as {
+        configured?: boolean;
+        source?: 'env' | 'server' | 'none';
+        url?: string;
+        anonKey?: string;
+      };
+      if (data.configured && data.url && data.anonKey) {
+        serverConfigCache = {
+          url: data.url.trim(),
+          anonKey: data.anonKey.trim(),
+          source: data.source || 'server',
+        };
+        saveRuntimeSupabaseConfig(data.url, data.anonKey);
+      } else {
+        serverConfigCache = { url: '', anonKey: '', source: 'none' };
+      }
+    }
+  } catch {
+    // ignore if offline / static build without server
+  }
+  return getSupabaseConfig();
+}
+
+export async function saveServerSupabaseConfigRemote(
+  url: string,
+  anonKey: string,
+  authToken: string | null
+): Promise<{ ok: boolean; error?: string }> {
+  if (!authToken) {
+    return { ok: false, error: 'Sesi Admin dibutuhkan untuk menyimpan konfigurasi permanen ke server.' };
+  }
+  try {
+    const res = await fetch('/api/config/supabase', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ url: url.trim(), anonKey: anonKey.trim() }),
+    });
+    const data = (await res.json()) as { ok?: boolean; error?: string };
+    if (!res.ok) {
+      return { ok: false, error: data.error || 'Gagal menyimpan konfigurasi Supabase ke server.' };
+    }
+    serverConfigCache = {
+      url: url.trim(),
+      anonKey: anonKey.trim(),
+      source: 'server',
+    };
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Server tidak merespons saat menyimpan konfigurasi.' };
+  }
+}
+
+export async function clearServerSupabaseConfigRemote(
+  authToken: string | null
+): Promise<{ ok: boolean; error?: string }> {
+  saveRuntimeSupabaseConfig('', '');
+  serverConfigCache = { url: '', anonKey: '', source: 'none' };
+  cachedClient = null;
+  cachedClientSignature = '';
+  if (!authToken) {
+    return { ok: true };
+  }
+  try {
+    const res = await fetch('/api/config/supabase', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    if (!res.ok) {
+      const data = (await res.json()) as { error?: string };
+      return { ok: false, error: data.error || 'Gagal menghapus konfigurasi server.' };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Gagal menghubungi server.' };
+  }
+}
+
+export function saveRuntimeSupabaseConfig(url: string, anonKey: string): void {
+  if (typeof window === 'undefined') return;
+  if (url.trim() && anonKey.trim()) {
+    window.localStorage.setItem(RUNTIME_URL_KEY, url.trim());
+    window.localStorage.setItem(RUNTIME_ANON_KEY, anonKey.trim());
+  } else {
+    window.localStorage.removeItem(RUNTIME_URL_KEY);
+    window.localStorage.removeItem(RUNTIME_ANON_KEY);
+  }
+  cachedClient = null;
+  cachedClientSignature = '';
+}
+
+export function getSupabaseClient(): SupabaseClient | null {
+  const { url, anonKey } = getSupabaseConfig();
+  if (!url || !anonKey) return null;
+
+  const signature = `${url}::${anonKey}`;
+  if (cachedClient && cachedClientSignature === signature) {
+    return cachedClient;
+  }
+
+  try {
+    cachedClient = createClient(url, anonKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+      },
+    });
+    cachedClientSignature = signature;
+    return cachedClient;
+  } catch {
+    return null;
+  }
+}
+
+export async function testSupabaseConnection(): Promise<{
+  ok: boolean;
+  message: string;
+}> {
+  const cfg = getSupabaseConfig();
+  const client = getSupabaseClient();
+  if (!client) {
+    return {
+      ok: false,
+      message:
+        'Konfigurasi VITE_SUPABASE_URL / ANON_KEY belum diisi. Berjalan di Mode Offline-Fallback.',
+    };
+  }
+
+  try {
+    const { error } = await client.from('school_settings').select('id').limit(1);
+    if (error) {
+      return {
+        ok: false,
+        message: `Terkoneksi ke proyek Supabase, tetapi tabel belum siap: ${error.message}`,
+      };
+    }
+    const sourceText =
+      cfg.source === 'env'
+        ? 'konfigurasi permanen environment (.env / Secrets)'
+        : cfg.source === 'server'
+          ? 'konfigurasi server permanen (aktif di semua browser)'
+          : 'konfigurasi browser lokal';
+    return {
+      ok: true,
+      message: `Terhubung otomatis ke Supabase (${sourceText}).`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      message: err instanceof Error ? err.message : 'Gagal menghubungi server Supabase.',
+    };
+  }
+}
+
+export async function uploadAssetToSupabaseOrLocal(
+  file: File,
+  folder: 'students' | 'school'
+): Promise<string> {
+  const client = getSupabaseClient();
+  if (client) {
+    const ext = file.name.split('.').pop() || 'png';
+    const filePath = `${folder}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { error } = await client.storage
+      .from('school-assets')
+      .upload(filePath, file, { upsert: true });
+
+    if (!error) {
+      const { data } = client.storage.from('school-assets').getPublicUrl(filePath);
+      if (data?.publicUrl) return data.publicUrl;
+    }
+  }
+
+  // Fallback to compressed data URL for immediate preview & local persistence
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error('Gagal membaca berkas gambar.'));
+    reader.readAsDataURL(file);
+  });
+}

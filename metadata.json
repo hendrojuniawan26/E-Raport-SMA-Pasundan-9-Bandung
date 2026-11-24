@@ -1,0 +1,6 @@
+{
+  "name": "E-Raport Kurikulum Merdeka - SMA Pasundan 9 Bandung",
+  "description": "Sistem Informasi Pengolahan Nilai Raport Kurikulum Merdeka SMA Pasundan 9 Bandung dengan import/export Excel, auto-deskripsi capaian kompetensi, leger nilai, cetak raport A4/F4, dan integrasi Supabase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
