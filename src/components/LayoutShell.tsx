@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Award,
   BarChart3,
+  Bell,
   BookOpen,
+  CheckCheck,
   ChevronRight,
   ClipboardCheck,
   Cloud,
@@ -19,11 +21,12 @@ import {
   RefreshCw,
   SlidersHorizontal,
   Table2,
+  TrendingUp,
   Users,
   X,
 } from 'lucide-react';
 import { ActiveTab, GuruSubTab, useApp, WaliSubTab } from '../context/AppContext';
-import { UserRole } from '../types/raport';
+import { GradeNotification, UserRole } from '../types/raport';
 import { SchoolCrest } from './SchoolCrest';
 
 const ROLE_LABELS: Record<UserRole, string> = {
@@ -39,6 +42,7 @@ const GURU_SUBMENU_LABELS: Record<GuruSubTab, string> = {
 };
 
 const WALI_SUBMENU_LABELS: Record<WaliSubTab, string> = {
+  performa: 'Performa Kelas',
   absensi: 'Absensi & Catatan',
   ekskul_p5: 'Ekskul & P5',
   leger: 'Leger Nilai Kelas',
@@ -48,32 +52,86 @@ const WALI_SUBMENU_LABELS: Record<WaliSubTab, string> = {
 export function LayoutShell({ children }: { children: React.ReactNode }) {
   const {
     currentUser,
-    isDemoSession,
     activeTab,
     setActiveTab,
     guruSubTab,
     setGuruSubTab,
     waliSubTab,
     setWaliSubTab,
+    openWaliSection,
     classes,
     subjects,
     settings,
     connectionMode,
     syncStatus,
     lastSavedAt,
-    loginWithRoleDemo,
     changeOwnPassword,
     logout,
+    notifications,
+    unreadNotificationCount,
+    realtimeStatus,
+    latestToastNotification,
+    dismissToastNotification,
+    markNotificationRead,
+    markAllNotificationsRead,
+    clearNotifications,
   } = useApp();
 
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [notifOpen, setNotifOpen] = useState(false);
   const [pwModalOpen, setPwModalOpen] = useState(false);
   const [currPw, setCurrPw] = useState('');
   const [newPw, setNewPw] = useState('');
   const [pwMsg, setPwMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [pwSaving, setPwSaving] = useState(false);
 
+  const notifMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleOutside = (e: MouseEvent) => {
+      if (notifMenuRef.current && !notifMenuRef.current.contains(e.target as Node)) {
+        setNotifOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, []);
+
+  useEffect(() => {
+    if (!latestToastNotification) return;
+    const timer = window.setTimeout(() => {
+      dismissToastNotification();
+    }, 7000);
+    return () => window.clearTimeout(timer);
+  }, [latestToastNotification, dismissToastNotification]);
+
   if (!currentUser) return null;
+
+  const canReceiveGradeAlerts =
+    currentUser.role === 'wali_kelas' || currentUser.role === 'admin';
+
+  const handleOpenNotification = (notif: GradeNotification) => {
+    markNotificationRead(notif.id);
+    setNotifOpen(false);
+    openWaliSection(
+      notif.type === 'submission_sent' ? 'kiriman_guru' : 'leger',
+      notif.classId
+    );
+  };
+
+  const formatNotifTime = (iso: string) => {
+    try {
+      const diffSec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+      if (diffSec < 60) return 'Baru saja';
+      if (diffSec < 3600) return `${Math.floor(diffSec / 60)} menit lalu`;
+      return new Date(iso).toLocaleTimeString('id-ID', {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    } catch {
+      return '';
+    }
+  };
 
   const assignedClass =
     currentUser.role === 'wali_kelas'
@@ -128,7 +186,7 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
     {
       id: 'wali_kelas',
       label: 'Menu Wali Kelas',
-      hint: 'Absensi, Ekskul, Leger & Kiriman',
+      hint: 'Performa, Absensi, Ekskul & Leger',
       icon: <Users className="w-4 h-4 shrink-0" />,
       roles: ['admin', 'wali_kelas'],
     },
@@ -234,6 +292,12 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
             hint: string;
             icon: React.ReactNode;
           }[] = [
+            {
+              id: 'performa',
+              label: 'Performa Kelas',
+              hint: 'Grafik distribusi & progres siswa',
+              icon: <TrendingUp className="w-3.5 h-3.5 shrink-0" />,
+            },
             {
               id: 'absensi',
               label: 'Absensi & Catatan',
@@ -377,47 +441,24 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
         })}
       </nav>
 
-      {/* Role Switcher (Demo Mode Only) & Active User Footer */}
+      {/* Active User Footer */}
       <div className="p-4 border-t border-white/10 space-y-3 bg-black/20">
-        {isDemoSession ? (
-          <div>
-            <label className="block text-[11px] font-medium text-slate-400 mb-1.5">
-              Ganti Peran Simulasi
-            </label>
-            <div className="grid grid-cols-3 gap-1 p-1 bg-white/5 border border-white/10 rounded-lg">
-              {(['admin', 'guru', 'wali_kelas'] as UserRole[]).map((role) => (
-                <button
-                  key={role}
-                  onClick={() => loginWithRoleDemo(role)}
-                  className={`px-2 py-1.5 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap ${
-                    currentUser.role === role
-                      ? 'bg-emerald-600 text-white shadow-xs'
-                      : 'text-slate-300 hover:text-white hover:bg-white/5'
-                  }`}
-                >
-                  {role === 'admin' ? 'Admin' : role === 'guru' ? 'Guru' : 'Wali'}
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-400/20 text-[11px] text-emerald-200">
-            <span className="truncate font-medium">
-              Sesi Terverifikasi · {ROLE_LABELS[currentUser.role]}
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                setPwMsg(null);
-                setPwModalOpen(true);
-              }}
-              title="Ubah kata sandi akun"
-              className="p-1 text-emerald-300 hover:text-white rounded"
-            >
-              <KeyRound className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        )}
+        <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-400/20 text-[11px] text-emerald-200">
+          <span className="truncate font-medium">
+            Sesi Terverifikasi · {ROLE_LABELS[currentUser.role]}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setPwMsg(null);
+              setPwModalOpen(true);
+            }}
+            title="Ubah kata sandi akun"
+            className="p-1 text-emerald-300 hover:text-white rounded"
+          >
+            <KeyRound className="w-3.5 h-3.5" />
+          </button>
+        </div>
 
         <div className="flex items-center justify-between gap-2 pt-0.5">
           <div className="min-w-0">
@@ -498,7 +539,7 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
             </div>
           </div>
 
-          <div className="flex items-center gap-6 shrink-0">
+          <div className="flex items-center gap-4 sm:gap-5 shrink-0">
             <div className="hidden md:flex items-center gap-2 text-xs text-slate-500 whitespace-nowrap">
               <BookOpen className="w-3.5 h-3.5 text-emerald-700" />
               <span className="font-mono tabular-nums">TA {settings.academicYear}</span>
@@ -506,6 +547,107 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
               <span>Semester {settings.semester}</span>
             </div>
             {renderSyncIndicator()}
+
+            {canReceiveGradeAlerts && (
+              <div className="relative" ref={notifMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setNotifOpen((prev) => !prev)}
+                  className="relative inline-flex items-center justify-center p-2 rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 hover:text-slate-900 transition-colors"
+                  aria-label="Notifikasi nilai masuk"
+                >
+                  <Bell className="w-4 h-4" />
+                  {unreadNotificationCount > 0 && (
+                    <span className="ml-1.5 px-1.5 py-0.5 text-[10px] font-bold font-mono tabular-nums bg-emerald-700 text-white rounded-md leading-none">
+                      {unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}
+                    </span>
+                  )}
+                </button>
+
+                {notifOpen && (
+                  <div className="absolute right-0 mt-2 w-80 sm:w-96 bg-white border border-slate-200 rounded-2xl shadow-xl z-50 overflow-hidden">
+                    <div className="px-4 py-3 border-b border-slate-200 bg-slate-50/80 flex items-start justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-bold text-slate-900">
+                          Notifikasi Nilai Masuk Guru
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-0.5">
+                          {realtimeStatus === 'connected'
+                            ? `Supabase Realtime aktif${assignedClass ? ` · ${assignedClass.name}` : ''}`
+                            : realtimeStatus === 'connecting'
+                              ? 'Menghubungkan Supabase Realtime...'
+                              : 'Menunggu koneksi Supabase Realtime'}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {unreadNotificationCount > 0 && (
+                          <button
+                            type="button"
+                            onClick={markAllNotificationsRead}
+                            title="Tandai semua sudah dibaca"
+                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-50 rounded-md"
+                          >
+                            <CheckCheck className="w-3.5 h-3.5" />
+                            <span>Dibaca</span>
+                          </button>
+                        )}
+                        {notifications.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={clearNotifications}
+                            className="px-2 py-1 text-[11px] font-medium text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-md"
+                          >
+                            Bersihkan
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="max-h-80 overflow-y-auto divide-y divide-slate-100">
+                      {notifications.length === 0 ? (
+                        <div className="py-8 px-4 text-center text-xs text-slate-500">
+                          <Bell className="w-6 h-6 text-slate-300 mx-auto mb-2" />
+                          <p className="font-medium text-slate-700">
+                            Belum ada notifikasi nilai baru
+                          </p>
+                          <p className="mt-1 text-[11px] text-slate-400">
+                            Pemberitahuan muncul otomatis saat Guru Mapel menginput atau mengirim nilai siswa{assignedClass ? ` kelas ${assignedClass.name}` : ''}.
+                          </p>
+                        </div>
+                      ) : (
+                        notifications.map((notif) => (
+                          <button
+                            key={notif.id}
+                            type="button"
+                            onClick={() => handleOpenNotification(notif)}
+                            className={`w-full text-left px-4 py-3 hover:bg-slate-50 transition-colors flex flex-col gap-1 ${
+                              !notif.read ? 'bg-emerald-50/50' : 'bg-white'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2 text-[11px]">
+                              <span className="font-semibold text-emerald-800 truncate">
+                                {notif.className} · {notif.subjectName}
+                              </span>
+                              <span className="font-mono tabular-nums text-slate-400 shrink-0">
+                                {!notif.read && (
+                                  <span className="text-emerald-700 font-semibold mr-1.5">
+                                    Baru ·
+                                  </span>
+                                )}
+                                {formatNotifTime(notif.createdAt)}
+                              </span>
+                            </div>
+                            <p className="text-xs text-slate-700 leading-snug">
+                              {notif.message}
+                            </p>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </header>
 
@@ -513,6 +655,51 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
           {children}
         </main>
       </div>
+
+      {/* Live Realtime Toast Alert for Wali Kelas */}
+      {canReceiveGradeAlerts && latestToastNotification && (
+        <div className="fixed bottom-5 right-5 z-50 max-w-sm w-[calc(100vw-2.5rem)] bg-slate-950 text-white border border-slate-800 rounded-2xl p-4 shadow-xl no-print">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <div className="p-2 rounded-xl bg-emerald-500/20 text-emerald-300 shrink-0">
+                <Bell className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="text-xs font-bold text-emerald-300 truncate">
+                  Nilai Baru Masuk · {latestToastNotification.className}
+                </div>
+                <p className="text-xs text-slate-200 mt-1 leading-relaxed">
+                  {latestToastNotification.message}
+                </p>
+                <div className="mt-2.5 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleOpenNotification(latestToastNotification)}
+                    className="px-3 py-1.5 text-[11px] font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors whitespace-nowrap"
+                  >
+                    Lihat Nilai Kelas
+                  </button>
+                  <button
+                    type="button"
+                    onClick={dismissToastNotification}
+                    className="px-2.5 py-1.5 text-[11px] font-medium text-slate-300 hover:text-white rounded-lg"
+                  >
+                    Tutup
+                  </button>
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={dismissToastNotification}
+              className="p-1 text-slate-400 hover:text-white rounded-md shrink-0"
+              aria-label="Tutup notifikasi"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Change Password Modal */}
       {pwModalOpen && (

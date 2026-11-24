@@ -39,11 +39,24 @@ const SESSION_SECRET =
 const DATA_DIR = path.resolve(process.cwd(), '.data');
 const USERS_FILE = path.join(DATA_DIR, 'auth-users.json');
 const SUPABASE_CONFIG_FILE = path.join(DATA_DIR, 'supabase-config.json');
+const SCHOOL_STATE_FILE = path.join(DATA_DIR, 'school-state.json');
 
 interface StoredSupabaseConfig {
   url: string;
   anonKey: string;
   updatedAt?: string;
+}
+
+interface StoredSchoolState {
+  settings?: Record<string, unknown>;
+  classes?: unknown[];
+  subjects?: unknown[];
+  students?: unknown[];
+  grades?: unknown[];
+  homeroomRecords?: unknown[];
+  gradeSubmissions?: unknown[];
+  updatedAt: string;
+  updatedBy?: string;
 }
 
 const SEED_USERS: Omit<StoredAuthUser, 'passwordSalt' | 'passwordHash' | 'createdAt' | 'updatedAt'>[] = [
@@ -199,6 +212,25 @@ function saveServerSupabaseConfig(url: string, anonKey: string): StoredSupabaseC
   return payload;
 }
 
+function loadSchoolState(): StoredSchoolState | null {
+  ensureDataDir();
+  if (!fs.existsSync(SCHOOL_STATE_FILE)) return null;
+  try {
+    const raw = fs.readFileSync(SCHOOL_STATE_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as StoredSchoolState;
+    if (parsed && typeof parsed === 'object') return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSchoolState(state: StoredSchoolState): StoredSchoolState {
+  ensureDataDir();
+  fs.writeFileSync(SCHOOL_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+  return state;
+}
+
 function hashPassword(password: string, existingSalt?: string): { salt: string; hash: string } {
   const salt = existingSalt || crypto.randomBytes(16).toString('hex');
   const hash = crypto.scryptSync(password, salt, 64).toString('hex');
@@ -302,11 +334,6 @@ function isAdminClaimed(users: StoredAuthUser[]): boolean {
   return users.some((u) => u.role === 'admin' && u.isActive && Boolean(u.passwordHash));
 }
 
-function isDemoAllowed(users: StoredAuthUser[]): boolean {
-  if (process.env.DISABLE_DEMO_LOGIN === 'true') return false;
-  return !isAdminClaimed(users);
-}
-
 function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   const header = req.headers.authorization || '';
   const match = /^Bearer\s+(.+)$/i.exec(header);
@@ -343,7 +370,7 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '5mb' }));
 
   // Shared Supabase public client config (automatically loaded by every browser)
   app.get('/api/config/supabase', (_req, res) => {
@@ -411,21 +438,16 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // Auth status & preview directory
+  // Auth status
   app.get('/api/auth/status', (_req, res) => {
     const users = loadUsers();
-    const demoEnabled = isDemoAllowed(users);
     const envPasscodeConfigured = Boolean((process.env.ADMIN_PASSCODE || '').trim());
     const adminClaimed = isAdminClaimed(users);
 
     res.json({
       adminClaimed,
       envPasscodeConfigured,
-      demoEnabled,
       usersCount: users.length,
-      demoAccounts: demoEnabled
-        ? users.filter((u) => u.isActive).map((u) => sanitizeUser(u, false))
-        : [],
     });
   });
 
@@ -500,7 +522,100 @@ async function startServer() {
 
     saveUsers(users);
     const token = signSessionToken({ sub: adminUser.id, role: 'admin', isDemo: false });
-    res.json({ token, user: sanitizeUser(adminUser, true), isDemo: false });
+    res.json({ token, user: sanitizeUser(adminUser, true) });
+  });
+
+  // Self-service registration for Guru Mata Pelajaran & Wali Kelas
+  app.post('/api/auth/register', (req, res) => {
+    const { email, fullName, nipNuptk, role, assignedClassId, password } = req.body as {
+      email?: string;
+      fullName?: string;
+      nipNuptk?: string;
+      role?: unknown;
+      assignedClassId?: string;
+      password?: string;
+    };
+
+    if (!isValidEmail(email)) {
+      res.status(400).json({ error: 'Format email sekolah tidak valid.' });
+      return;
+    }
+    if (typeof fullName !== 'string' || fullName.trim().length < 2) {
+      res.status(400).json({ error: 'Nama lengkap & gelar minimal 2 karakter.' });
+      return;
+    }
+    if (role !== 'guru' && role !== 'wali_kelas') {
+      res.status(403).json({
+        error: 'Pendaftaran mandiri hanya tersedia untuk peran Guru Mata Pelajaran atau Wali Kelas.',
+      });
+      return;
+    }
+    if (typeof password !== 'string' || password.length < 6) {
+      res.status(400).json({ error: 'Kata sandi minimal 6 karakter.' });
+      return;
+    }
+
+    const users = loadUsers();
+    const normalizedEmail = email.trim().toLowerCase();
+    const existingIdx = users.findIndex((u) => u.email.toLowerCase() === normalizedEmail);
+    const now = new Date().toISOString();
+    const { salt, hash } = hashPassword(password);
+
+    let registeredUser: StoredAuthUser;
+    if (existingIdx >= 0) {
+      const existing = users[existingIdx];
+      if (existing.role === 'admin' || existing.passwordHash) {
+        res.status(409).json({
+          error: 'Email tersebut sudah terdaftar dan aktif. Silakan masuk menggunakan kata sandi Anda.',
+        });
+        return;
+      }
+      if (!existing.isActive) {
+        res.status(403).json({ error: 'Akun ini sedang dinonaktifkan oleh Admin Sekolah.' });
+        return;
+      }
+      registeredUser = {
+        ...existing,
+        fullName: fullName.trim(),
+        nipNuptk: typeof nipNuptk === 'string' && nipNuptk.trim() ? nipNuptk.trim() : existing.nipNuptk,
+        role,
+        assignedClassId:
+          role === 'wali_kelas' && typeof assignedClassId === 'string' && assignedClassId.trim()
+            ? assignedClassId.trim()
+            : existing.assignedClassId,
+        passwordSalt: salt,
+        passwordHash: hash,
+        updatedAt: now,
+      };
+      users[existingIdx] = registeredUser;
+    } else {
+      registeredUser = {
+        id: `user-${role}-${Date.now()}`,
+        email: normalizedEmail,
+        fullName: fullName.trim(),
+        nipNuptk: typeof nipNuptk === 'string' ? nipNuptk.trim() : '',
+        nrks: role === 'wali_kelas' ? 'WK' : 'GR',
+        role,
+        isActive: true,
+        assignedClassId:
+          role === 'wali_kelas' && typeof assignedClassId === 'string' && assignedClassId.trim()
+            ? assignedClassId.trim()
+            : undefined,
+        passwordSalt: salt,
+        passwordHash: hash,
+        createdAt: now,
+        updatedAt: now,
+      };
+      users.push(registeredUser);
+    }
+
+    saveUsers(users);
+    const token = signSessionToken({
+      sub: registeredUser.id,
+      role: registeredUser.role,
+      isDemo: false,
+    });
+    res.status(201).json({ token, user: sanitizeUser(registeredUser, true) });
   });
 
   // Email + Password Login
@@ -531,67 +646,31 @@ async function startServer() {
     if (!envAdminMatch && !hashMatch) {
       if (!user.passwordHash && user.role === 'admin' && !isAdminClaimed(users)) {
         res.status(401).json({
-          error: 'Akun Admin belum memiliki kata sandi. Gunakan menu "Aktivasi Admin" untuk mengatur kata sandi.',
+          error: 'Akun Admin belum diaktifkan. Gunakan tab "Aktivasi Admin" untuk membuat kata sandi Admin.',
         });
         return;
       }
       res.status(401).json({
         error: user.passwordHash
           ? 'Email atau kata sandi tidak sesuai.'
-          : 'Akun ini belum memiliki kata sandi. Minta Admin mengatur kata sandi atau gunakan Simulasi Multi-Role.',
+          : 'Akun belum memiliki kata sandi. Silakan aktifkan melalui tab "Daftar Guru / Wali" atau hubungi Admin Sekolah.',
       });
       return;
     }
 
     const token = signSessionToken({ sub: user.id, role: user.role, isDemo: false });
-    res.json({ token, user: sanitizeUser(user, true), isDemo: false });
-  });
-
-  // Preview Demo Multi-Role Login (automatically locked once Admin claims a password or ADMIN_PASSCODE is set)
-  app.post('/api/auth/demo-login', (req, res) => {
-    const users = loadUsers();
-    if (!isDemoAllowed(users)) {
-      res.status(403).json({
-        error: 'Mode simulasi cepat dikunci karena kata sandi Admin sudah aktif. Silakan masuk menggunakan email dan kata sandi akun.',
-      });
-      return;
-    }
-
-    const { role, userId } = req.body as { role?: unknown; userId?: string };
-    let target: StoredAuthUser | undefined;
-
-    if (typeof userId === 'string' && userId.trim()) {
-      target = users.find((u) => u.id === userId.trim() && u.isActive);
-    }
-    if (!target && isValidRole(role)) {
-      target = users.find((u) => u.role === role && u.isActive);
-    }
-
-    if (!target) {
-      res.status(404).json({ error: 'Akun simulasi untuk peran tersebut tidak tersedia.' });
-      return;
-    }
-
-    const token = signSessionToken({ sub: target.id, role: target.role, isDemo: true });
-    res.json({ token, user: sanitizeUser(target, true), isDemo: true });
+    res.json({ token, user: sanitizeUser(user, true) });
   });
 
   // Validate active session
   app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
     res.json({
       user: sanitizeUser(req.authUser!, true),
-      isDemo: Boolean(req.auth?.isDemo),
     });
   });
 
-  // Change own password (for authenticated non-demo users)
+  // Change own password (for authenticated users)
   app.post('/api/auth/change-password', requireAuth, (req: AuthenticatedRequest, res) => {
-    if (req.auth?.isDemo) {
-      res.status(403).json({
-        error: 'Mode simulasi tidak dapat mengubah kata sandi pribadi. Masuk dengan akun resmi atau kelola via Admin.',
-      });
-      return;
-    }
 
     const { currentPassword, newPassword } = req.body as {
       currentPassword?: string;
@@ -810,6 +889,101 @@ async function startServer() {
 
     saveUsers(remaining);
     res.json({ ok: true });
+  });
+
+  // Shared Multi-Teacher Academic State Sync (Protected by Bearer Auth & Role Boundaries)
+  app.get('/api/school-state', requireAuth, (_req: AuthenticatedRequest, res) => {
+    const state = loadSchoolState();
+    if (!state) {
+      res.json({ initialized: false });
+      return;
+    }
+    res.json({ initialized: true, state });
+  });
+
+  app.put('/api/school-state', requireAuth, (req: AuthenticatedRequest, res) => {
+    const role = req.authUser!.role;
+    const incoming = req.body as Partial<StoredSchoolState>;
+    const existing: StoredSchoolState = loadSchoolState() || {
+      updatedAt: new Date().toISOString(),
+    };
+
+    const next: StoredSchoolState = {
+      ...existing,
+      updatedAt: new Date().toISOString(),
+      updatedBy: req.authUser!.fullName,
+    };
+
+    if (role === 'admin') {
+      if (incoming.settings && typeof incoming.settings === 'object') {
+        next.settings = incoming.settings;
+      }
+      if (Array.isArray(incoming.classes)) next.classes = incoming.classes;
+      if (Array.isArray(incoming.subjects)) next.subjects = incoming.subjects;
+      if (Array.isArray(incoming.students)) next.students = incoming.students;
+      if (Array.isArray(incoming.grades)) next.grades = incoming.grades;
+      if (Array.isArray(incoming.homeroomRecords)) {
+        next.homeroomRecords = incoming.homeroomRecords;
+      }
+      if (Array.isArray(incoming.gradeSubmissions)) {
+        next.gradeSubmissions = incoming.gradeSubmissions;
+      }
+    } else if (role === 'guru') {
+      if (Array.isArray(incoming.grades)) next.grades = incoming.grades;
+      if (Array.isArray(incoming.gradeSubmissions)) {
+        next.gradeSubmissions = incoming.gradeSubmissions;
+      }
+      if (Array.isArray(incoming.subjects) && Array.isArray(existing.subjects)) {
+        // Guru can update TP list & SAS title on existing subjects
+        const incomingMap = new Map(
+          incoming.subjects
+            .filter((s): s is { id: string; tpList?: unknown; sasTitle?: unknown } =>
+              Boolean(s && typeof s === 'object' && 'id' in s)
+            )
+            .map((s) => [s.id, s])
+        );
+        next.subjects = existing.subjects.map((sub) => {
+          if (!sub || typeof sub !== 'object' || !('id' in sub)) return sub;
+          const patch = incomingMap.get(String((sub as { id: string }).id));
+          if (!patch) return sub;
+          return {
+            ...sub,
+            tpList: patch.tpList ?? (sub as { tpList?: unknown }).tpList,
+            sasTitle: patch.sasTitle ?? (sub as { sasTitle?: unknown }).sasTitle,
+          };
+        });
+      }
+    } else if (role === 'wali_kelas') {
+      if (Array.isArray(incoming.grades)) next.grades = incoming.grades;
+      if (Array.isArray(incoming.homeroomRecords)) {
+        next.homeroomRecords = incoming.homeroomRecords;
+      }
+      if (Array.isArray(incoming.gradeSubmissions)) {
+        next.gradeSubmissions = incoming.gradeSubmissions;
+      }
+      if (Array.isArray(incoming.subjects) && Array.isArray(existing.subjects)) {
+        const incomingMap = new Map(
+          incoming.subjects
+            .filter((s): s is { id: string; tpList?: unknown; sasTitle?: unknown } =>
+              Boolean(s && typeof s === 'object' && 'id' in s)
+            )
+            .map((s) => [s.id, s])
+        );
+        next.subjects = existing.subjects.map((sub) => {
+          if (!sub || typeof sub !== 'object' || !('id' in sub)) return sub;
+          const patch = incomingMap.get(String((sub as { id: string }).id));
+          if (!patch) return sub;
+          return {
+            ...sub,
+            tpList: patch.tpList ?? (sub as { tpList?: unknown }).tpList,
+            sasTitle: patch.sasTitle ?? (sub as { sasTitle?: unknown }).sasTitle,
+          };
+        });
+      }
+    }
+
+    const saved = saveSchoolState(next);
+    res.json({ ok: true, updatedAt: saved.updatedAt });
   });
 
   if (process.env.NODE_ENV !== 'production') {

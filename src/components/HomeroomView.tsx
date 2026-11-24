@@ -20,6 +20,7 @@ import {
 } from '../types/raport';
 import { exportClassLegerExcel } from '../utils/excelProcessor';
 import { recalculateSubjectGrade } from '../utils/gradeCalculator';
+import { WaliKelasDashboard } from './WaliKelasDashboard';
 
 export function HomeroomView() {
   const {
@@ -212,6 +213,7 @@ export function HomeroomView() {
           <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg mt-4 sm:mt-5">
             {(
               [
+                { id: 'performa', label: 'Performa Kelas' },
                 { id: 'absensi', label: 'Absensi & Catatan' },
                 { id: 'ekskul_p5', label: 'Ekskul & P5' },
                 { id: 'leger', label: 'Leger Nilai Kelas' },
@@ -264,6 +266,9 @@ export function HomeroomView() {
           </button>
         </div>
       </div>
+
+      {/* SubTab 0: Ringkasan Performa Kelas (Recharts) */}
+      {subTab === 'performa' && <WaliKelasDashboard embedded />}
 
       {/* SubTab 1: Absensi & Catatan Wali */}
       {subTab === 'absensi' && (

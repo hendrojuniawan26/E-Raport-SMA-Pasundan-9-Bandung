@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
@@ -14,8 +14,10 @@ import {
 import { useApp } from '../context/AppContext';
 import { getRaportSubjectGroup, isSubjectForClass } from '../types/raport';
 import { recalculateSubjectGrade } from '../utils/gradeCalculator';
+import { WaliKelasDashboard } from './WaliKelasDashboard';
 
 export function DashboardView() {
+  const [adminViewMode, setAdminViewMode] = useState<'school' | 'wali'>('school');
   const {
     currentUser,
     students,
@@ -28,7 +30,6 @@ export function DashboardView() {
     setFocusedClassId,
     openGradeInput,
     openGuruSection,
-    openWaliSection,
     getGradeSubmission,
   } = useApp();
 
@@ -123,8 +124,59 @@ export function DashboardView() {
     summary.predikatCounts.C +
     summary.predikatCounts.D;
 
+  if (currentUser?.role === 'wali_kelas') {
+    return <WaliKelasDashboard />;
+  }
+
+  if (currentUser?.role === 'admin' && adminViewMode === 'wali') {
+    return (
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="inline-flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-xl">
+            <button
+              type="button"
+              onClick={() => setAdminViewMode('school')}
+              className="px-3.5 py-1.5 text-xs font-semibold rounded-lg text-slate-600 hover:text-slate-900 whitespace-nowrap"
+            >
+              Pusat Kendali Sekolah
+            </button>
+            <button
+              type="button"
+              onClick={() => setAdminViewMode('wali')}
+              className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-white text-emerald-800 shadow-xs whitespace-nowrap"
+            >
+              Dashboard Performa Wali Kelas
+            </button>
+          </div>
+        </div>
+        <WaliKelasDashboard />
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
+      {currentUser?.role === 'admin' && (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="inline-flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-xl">
+            <button
+              type="button"
+              onClick={() => setAdminViewMode('school')}
+              className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-white text-slate-900 shadow-xs whitespace-nowrap"
+            >
+              Pusat Kendali Sekolah
+            </button>
+            <button
+              type="button"
+              onClick={() => setAdminViewMode('wali')}
+              className="px-3.5 py-1.5 text-xs font-semibold rounded-lg text-slate-600 hover:text-slate-900 whitespace-nowrap"
+            >
+              Dashboard Performa Wali Kelas
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Smart-School Command Banner + Class Segmented Filter */}
       <div className="bg-obsidian-grid text-white rounded-2xl p-6 sm:p-7 border border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
         <div className="space-y-2 max-w-2xl">
@@ -164,7 +216,7 @@ export function DashboardView() {
               <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-700" />
               <span>Input / Upload Nilai</span>
             </button>
-            {(currentUser?.role === 'admin' || currentUser?.role === 'wali_kelas') && (
+            {currentUser?.role === 'admin' && (
               <button
                 onClick={() => setActiveTab('raport')}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-white/10 hover:bg-white/15 border border-white/15 rounded-lg transition-colors whitespace-nowrap shrink-0"
@@ -181,11 +233,7 @@ export function DashboardView() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <button
           type="button"
-          onClick={() =>
-            currentUser?.role === 'wali_kelas'
-              ? openWaliSection('kiriman_guru', selectedClass.id)
-              : openGuruSection('atur_tp', selectedClass.id, classSubjects[0]?.id)
-          }
+          onClick={() => openGuruSection('atur_tp', selectedClass.id, classSubjects[0]?.id)}
           className="text-left bg-white border border-slate-200/90 hover:border-emerald-600 rounded-xl p-4 transition-all duration-150 group flex items-start justify-between gap-3"
         >
           <div className="space-y-1">
@@ -193,9 +241,7 @@ export function DashboardView() {
               01. Siapkan TP & Template Nilai
             </div>
             <div className="text-sm font-semibold text-slate-900 group-hover:text-emerald-800">
-              {currentUser?.role === 'wali_kelas'
-                ? 'Pantau Nilai Masuk per Mapel'
-                : 'Unduh Template Excel per Mapel'}
+              Unduh Template Excel per Mapel
             </div>
             <p className="text-xs text-slate-500">
               Daftar siswa {selectedClass?.name} terisi otomatis di file Excel resmi.
@@ -206,26 +252,18 @@ export function DashboardView() {
 
         <button
           type="button"
-          onClick={() =>
-            currentUser?.role === 'wali_kelas'
-              ? openWaliSection('absensi', selectedClass.id)
-              : openGradeInput(selectedClass.id, classSubjects[0]?.id)
-          }
+          onClick={() => openGradeInput(selectedClass.id, classSubjects[0]?.id)}
           className="text-left bg-white border border-slate-200/90 hover:border-emerald-600 rounded-xl p-4 transition-all duration-150 group flex items-start justify-between gap-3"
         >
           <div className="space-y-1">
             <div className="text-xs font-semibold text-sky-700">
-              02. {currentUser?.role === 'wali_kelas' ? 'Lengkapi Absensi & P5' : 'Input atau Upload Nilai'}
+              02. Input atau Upload Nilai
             </div>
             <div className="text-sm font-semibold text-slate-900 group-hover:text-emerald-800">
-              {currentUser?.role === 'wali_kelas'
-                ? 'Absensi, Ekskul & Leger Kelas'
-                : 'Hitung Bobot & Deskripsi Otomatis'}
+              Hitung Bobot & Deskripsi Otomatis
             </div>
             <p className="text-xs text-slate-500">
-              {currentUser?.role === 'wali_kelas'
-                ? 'Catat ketidakhadiran, kegiatan ekskul, dan projek P5 siswa.'
-                : 'Auto-PRK dan narasi capaian kompetensi langsung tersusun instan.'}
+              Auto-PRK dan narasi capaian kompetensi langsung tersusun instan.
             </p>
           </div>
           <ArrowRight className="w-4 h-4 text-slate-400 group-hover:text-emerald-700 group-hover:translate-x-0.5 transition-all shrink-0 mt-1" />

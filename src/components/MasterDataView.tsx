@@ -158,7 +158,34 @@ CREATE TABLE IF NOT EXISTS public.homeroom_records (
   p5_projects JSONB NOT NULL DEFAULT '[]'::jsonb,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(student_id, academic_year, semester)
-);`;
+);
+
+CREATE TABLE IF NOT EXISTS public.grade_notifications (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL DEFAULT 'single_grade',
+  class_id TEXT NOT NULL,
+  class_name TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  subject_name TEXT NOT NULL,
+  subject_code TEXT DEFAULT '',
+  student_id TEXT,
+  student_name TEXT,
+  student_count INTEGER,
+  nilai_akhir NUMERIC(5,2),
+  predikat TEXT,
+  teacher_id TEXT,
+  teacher_name TEXT NOT NULL,
+  actor_role TEXT NOT NULL DEFAULT 'guru',
+  message TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE public.grade_notifications ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Grade notifications readable" ON public.grade_notifications FOR SELECT TO authenticated, anon USING (true);
+CREATE POLICY "Grade notifications insertable" ON public.grade_notifications FOR INSERT TO authenticated, anon WITH CHECK (true);
+
+DO $$ BEGIN ALTER PUBLICATION supabase_realtime ADD TABLE public.student_grades; EXCEPTION WHEN duplicate_object THEN null; END $$;
+DO $$ BEGIN ALTER PUBLICATION supabase_realtime ADD TABLE public.grade_notifications; EXCEPTION WHEN duplicate_object THEN null; END $$;`;
 
 export function MasterDataView() {
   const {

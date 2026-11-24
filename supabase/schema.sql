@@ -328,3 +328,45 @@ SELECT
   70,
   90
 WHERE NOT EXISTS (SELECT 1 FROM public.school_settings);
+
+-- 11. TABEL NOTIFIKASI REALTIME NILAI BARU UNTUK WALI KELAS
+CREATE TABLE IF NOT EXISTS public.grade_notifications (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL DEFAULT 'single_grade',
+  class_id TEXT NOT NULL,
+  class_name TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  subject_name TEXT NOT NULL,
+  subject_code TEXT DEFAULT '',
+  student_id TEXT,
+  student_name TEXT,
+  student_count INTEGER,
+  nilai_akhir NUMERIC(5,2),
+  predikat TEXT,
+  teacher_id TEXT,
+  teacher_name TEXT NOT NULL,
+  actor_role TEXT NOT NULL DEFAULT 'guru',
+  message TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE public.grade_notifications ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Grade notifications readable by staff" ON public.grade_notifications
+  FOR SELECT TO authenticated, anon USING (true);
+CREATE POLICY "Grade notifications insertable by staff" ON public.grade_notifications
+  FOR INSERT TO authenticated, anon WITH CHECK (true);
+
+-- Aktifkan Supabase Realtime Postgres Changes untuk tabel nilai & notifikasi
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.student_grades;
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.grade_notifications;
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+

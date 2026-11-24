@@ -42,6 +42,7 @@ export default defineConfig(() => {
         'react/jsx-runtime',
         'react/jsx-dev-runtime',
         'lucide-react',
+        'recharts',
         '@supabase/supabase-js',
         'xlsx',
       ],

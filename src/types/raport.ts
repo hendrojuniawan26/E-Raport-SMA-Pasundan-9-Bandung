@@ -173,6 +173,29 @@ export interface GradeSubmission {
 
 export type ConnectionMode = 'supabase' | 'offline';
 export type SyncStatus = 'connected' | 'syncing' | 'saved_local' | 'error';
+export type RealtimeConnectionStatus = 'connected' | 'connecting' | 'disconnected';
+export type GradeNotificationType = 'single_grade' | 'batch_grade' | 'submission_sent';
+
+export interface GradeNotification {
+  id: string;
+  type: GradeNotificationType;
+  classId: string;
+  className: string;
+  subjectId: string;
+  subjectName: string;
+  subjectCode: string;
+  studentId?: string;
+  studentName?: string;
+  studentCount?: number;
+  nilaiAkhir?: number;
+  predikat?: 'A' | 'B' | 'C' | 'D';
+  teacherId?: string;
+  teacherName: string;
+  actorRole: UserRole;
+  message: string;
+  createdAt: string;
+  read: boolean;
+}
 
 export const P3_DIMENSIONS = [
   'D.1 Beriman, Bertakwa & Berakhlak Mulia',

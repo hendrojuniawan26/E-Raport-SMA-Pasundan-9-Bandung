@@ -9,6 +9,12 @@ import {
   INITIAL_USERS,
 } from '../data/seedData';
 import {
+  fetchRecentSupabaseNotifications,
+  PostgresStudentGradeRow,
+  publishGradeRealtimeNotification,
+  subscribeGradeRealtimeNotifications,
+} from '../lib/realtimeNotifications';
+import {
   clearServerSupabaseConfigRemote,
   getSupabaseClient,
   getSupabaseConfig,
@@ -21,8 +27,10 @@ import {
 import {
   ClassRoom,
   ConnectionMode,
+  GradeNotification,
   GradeSubmission,
   HomeroomRecord,
+  RealtimeConnectionStatus,
   SchoolSettings,
   Student,
   Subject,
@@ -34,6 +42,41 @@ import {
 import { recalculateSubjectGrade } from '../utils/gradeCalculator';
 
 const STORAGE_KEY = 'pasundan9_eraport_state_v3';
+const NOTIF_STORAGE_KEY = 'pasundan9_eraport_notifications_v1';
+const READ_NOTIF_IDS_KEY = 'pasundan9_eraport_read_notif_ids_v1';
+
+function loadStoredNotifications(): GradeNotification[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(NOTIF_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as GradeNotification[]).slice(0, 50) : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadReadNotificationIds(): Set<string> {
+  if (typeof window === 'undefined') return new Set();
+  try {
+    const raw = window.localStorage.getItem(READ_NOTIF_IDS_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? new Set(parsed.map(String)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveReadNotificationIds(ids: Set<string>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(READ_NOTIF_IDS_KEY, JSON.stringify(Array.from(ids).slice(-200)));
+  } catch {
+    // ignore storage quota
+  }
+}
 
 interface PersistedState {
   settings: SchoolSettings;
@@ -89,7 +132,7 @@ export type ActiveTab =
   | 'master_data';
 
 export type GuruSubTab = 'olah_nilai' | 'atur_tp' | 'sikap';
-export type WaliSubTab = 'absensi' | 'ekskul_p5' | 'leger' | 'kiriman_guru';
+export type WaliSubTab = 'performa' | 'absensi' | 'ekskul_p5' | 'leger' | 'kiriman_guru';
 export type ReportPaperSize = 'A4' | 'F4';
 
 export interface AuthUserSummary extends UserProfile {
@@ -99,14 +142,11 @@ export interface AuthUserSummary extends UserProfile {
 export interface AuthSystemStatus {
   adminClaimed: boolean;
   envPasscodeConfigured: boolean;
-  demoEnabled: boolean;
   usersCount: number;
-  demoAccounts: AuthUserSummary[];
 }
 
 interface AppContextValue {
   currentUser: UserProfile | null;
-  isDemoSession: boolean;
   authStatus: AuthSystemStatus;
   refreshAuthStatus: () => Promise<void>;
   activeTab: ActiveTab;
@@ -138,8 +178,15 @@ interface AppContextValue {
   homeroomRecords: HomeroomRecord[];
   gradeSubmissions: GradeSubmission[];
   // Auth & User Management
-  loginWithRoleDemo: (role: UserRole, userId?: string) => Promise<{ ok: boolean; error?: string }>;
   loginWithEmailPassword: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
+  registerTeacherAccount: (payload: {
+    email: string;
+    fullName: string;
+    nipNuptk?: string;
+    role: 'guru' | 'wali_kelas';
+    assignedClassId?: string;
+    password: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
   claimFirstAdmin: (payload: {
     email: string;
     fullName: string;
@@ -189,6 +236,15 @@ interface AppContextValue {
   resetDemoData: () => void;
   configureSupabase: (url: string, anonKey: string) => Promise<{ ok: boolean; message: string }>;
   disconnectSupabase: () => Promise<void>;
+  // Realtime Notifications for Wali Kelas
+  notifications: GradeNotification[];
+  unreadNotificationCount: number;
+  realtimeStatus: RealtimeConnectionStatus;
+  latestToastNotification: GradeNotification | null;
+  dismissToastNotification: () => void;
+  markNotificationRead: (id: string) => void;
+  markAllNotificationsRead: () => void;
+  clearNotifications: () => void;
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
@@ -198,13 +254,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const [currentUser, setCurrentUser] = useState<AuthUserSummary | null>(null);
   const [authToken, setAuthToken] = useState<string | null>(null);
-  const [isDemoSession, setIsDemoSession] = useState<boolean>(false);
   const [authStatus, setAuthStatus] = useState<AuthSystemStatus>({
     adminClaimed: false,
     envPasscodeConfigured: false,
-    demoEnabled: true,
     usersCount: INITIAL_USERS.length,
-    demoAccounts: INITIAL_USERS,
   });
   const [activeTab, setActiveTabState] = useState<ActiveTab>('dashboard');
   const [guruSubTab, setGuruSubTab] = useState<GuruSubTab>('olah_nilai');
@@ -275,21 +328,48 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [lastSavedAt, setLastSavedAt] = useState<string>(
     new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })
   );
+  const [notifications, setNotifications] = useState<GradeNotification[]>(loadStoredNotifications);
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeConnectionStatus>('disconnected');
+  const [latestToastNotification, setLatestToastNotification] =
+    useState<GradeNotification | null>(null);
 
   const saveTimerRef = useRef<number | null>(null);
   const isFirstRender = useRef(true);
+  const skipNextRemoteSyncRef = useRef(false);
+  const gradeNotifyTimersRef = useRef<Map<string, number>>(new Map());
+  const readNotifIdsRef = useRef<Set<string>>(loadReadNotificationIds());
+  const latestDataRef = useRef({
+    students,
+    classes,
+    subjects,
+    currentUser,
+    authToken,
+  });
+  latestDataRef.current = {
+    students,
+    classes,
+    subjects,
+    currentUser,
+    authToken,
+  };
 
-  const applyAuthenticatedFocus = (user: AuthUserSummary) => {
+  const applyAuthenticatedFocus = (
+    user: AuthUserSummary,
+    overrideSubjects?: Subject[],
+    overrideClasses?: ClassRoom[]
+  ) => {
+    const subjectList = overrideSubjects || subjects;
+    const classList = overrideClasses || classes;
     if (user.role === 'guru') {
-      const assignedSub = subjects.find((s) => s.teacherId === user.id);
+      const assignedSub = subjectList.find((s) => s.teacherId === user.id);
       if (assignedSub) setFocusedSubjectId(assignedSub.id);
       setActiveTabState('input_nilai');
     } else if (user.role === 'wali_kelas') {
       const assignedCls =
-        classes.find((c) => c.id === user.assignedClassId) ||
-        classes.find((c) => c.homeroomTeacherId === user.id);
+        classList.find((c) => c.id === user.assignedClassId) ||
+        classList.find((c) => c.homeroomTeacherId === user.id);
       if (assignedCls) setFocusedClassId(assignedCls.id);
-      setActiveTabState('wali_kelas');
+      setActiveTabState('dashboard');
     } else {
       setActiveTabState('dashboard');
     }
@@ -301,9 +381,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (res.ok) {
         const data = (await res.json()) as AuthSystemStatus;
         setAuthStatus(data);
-        if (data.demoAccounts && data.demoAccounts.length > 0) {
-          setUsers(data.demoAccounts);
-        }
       }
     } catch {
       // ignore if backend status endpoint unreachable during static preview
@@ -324,6 +401,65 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // ignore
     }
+  };
+
+  const loadSchoolStateFromServer = async (
+    token: string,
+    role?: UserRole
+  ): Promise<{ subjects?: Subject[]; classes?: ClassRoom[] }> => {
+    try {
+      const res = await fetch('/api/school-state', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return {};
+      const data = (await res.json()) as {
+        initialized?: boolean;
+        state?: Partial<PersistedState> & { updatedAt?: string };
+      };
+
+      if (data.initialized && data.state) {
+        const remote = data.state;
+        skipNextRemoteSyncRef.current = true;
+        if (remote.settings) {
+          setSettings({
+            ...remote.settings,
+            logoUrl: remote.settings.logoUrl || INITIAL_SCHOOL_SETTINGS.logoUrl,
+          });
+        }
+        if (Array.isArray(remote.classes)) setClasses(remote.classes);
+        if (Array.isArray(remote.subjects)) setSubjects(remote.subjects);
+        if (Array.isArray(remote.students)) setStudents(remote.students);
+        if (Array.isArray(remote.grades)) setGrades(remote.grades);
+        if (Array.isArray(remote.homeroomRecords)) setHomeroomRecords(remote.homeroomRecords);
+        if (Array.isArray(remote.gradeSubmissions)) setGradeSubmissions(remote.gradeSubmissions);
+        return {
+          subjects: Array.isArray(remote.subjects) ? remote.subjects : undefined,
+          classes: Array.isArray(remote.classes) ? remote.classes : undefined,
+        };
+      }
+
+      if (!data.initialized && role === 'admin') {
+        await fetch('/api/school-state', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            settings,
+            classes,
+            subjects,
+            students,
+            grades,
+            homeroomRecords,
+            gradeSubmissions,
+          }),
+        }).catch(() => {});
+      }
+    } catch {
+      // ignore network error and keep local state
+    }
+    return {};
   };
 
   // Check Auth Status & load shared cross-browser Supabase connectivity on mount
@@ -368,7 +504,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 isActive: true,
               };
               setCurrentUser(mapped);
-              setIsDemoSession(false);
               applyAuthenticatedFocus(mapped);
             }
           }
@@ -379,11 +514,145 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     initSupabase();
   }, []);
 
-  // Debounced Auto-Save to LocalStorage + Supabase Sync if connected
+  // Persist notifications locally whenever updated
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(NOTIF_STORAGE_KEY, JSON.stringify(notifications.slice(0, 50)));
+    } catch {
+      // ignore storage quota
+    }
+  }, [notifications]);
+
+  const shouldAcceptNotificationForUser = (incoming: GradeNotification): boolean => {
+    const { currentUser: activeUser, classes: allClasses } = latestDataRef.current;
+    if (!activeUser) return false;
+    if (activeUser.role === 'guru') return false;
+    if (incoming.teacherId && incoming.teacherId === activeUser.id) return false;
+
+    if (activeUser.role === 'wali_kelas') {
+      const waliClassId =
+        activeUser.assignedClassId ||
+        allClasses.find((c) => c.homeroomTeacherId === activeUser.id)?.id;
+      if (waliClassId && incoming.classId !== waliClassId) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const pushIncomingNotification = (incoming: GradeNotification, showToast: boolean) => {
+    if (!shouldAcceptNotificationForUser(incoming)) return;
+    const alreadyRead = readNotifIdsRef.current.has(incoming.id);
+    const normalized: GradeNotification = {
+      ...incoming,
+      read: alreadyRead || incoming.read,
+    };
+
+    let inserted = false;
+    setNotifications((prev) => {
+      if (prev.some((n) => n.id === normalized.id)) {
+        return prev;
+      }
+      inserted = true;
+      return [normalized, ...prev].slice(0, 50);
+    });
+
+    if (inserted && showToast && !normalized.read) {
+      setLatestToastNotification(normalized);
+    }
+  };
+
+  // Subscribe to Supabase Realtime channel for live grade notifications
+  useEffect(() => {
+    const client = getSupabaseClient();
+    if (!client || !currentUser) {
+      setRealtimeStatus('disconnected');
+      return;
+    }
+
+    const unsubscribe = subscribeGradeRealtimeNotifications({
+      client,
+      onBroadcastNotification: (notif) => {
+        pushIncomingNotification(notif, true);
+        const token = latestDataRef.current.authToken;
+        const role = latestDataRef.current.currentUser?.role;
+        if (token && role && role !== 'guru') {
+          loadSchoolStateFromServer(token, role).catch(() => {});
+        }
+      },
+      onPostgresNotificationInsert: (notif) => {
+        pushIncomingNotification(notif, true);
+      },
+      onPostgresGradeChange: (row: PostgresStudentGradeRow) => {
+        const { students: stuList, subjects: subList, classes: clsList, authToken: token, currentUser: user } =
+          latestDataRef.current;
+        const stu = stuList.find((s) => s.id === row.student_id);
+        const sub = subList.find((s) => s.id === row.subject_id);
+        if (!stu || !sub) return;
+        const cls = clsList.find((c) => c.id === stu.classId);
+        const score = typeof row.nilai_akhir === 'number' ? row.nilai_akhir : Number(row.nilai_akhir) || 0;
+        if (score <= 0) return;
+
+        const pred =
+          row.predikat === 'A' || row.predikat === 'B' || row.predikat === 'C' || row.predikat === 'D'
+            ? row.predikat
+            : undefined;
+
+        pushIncomingNotification(
+          {
+            id: `pg-${stu.id}-${sub.id}-${row.updated_at || Date.now()}`,
+            type: 'single_grade',
+            classId: stu.classId,
+            className: cls?.name || stu.classId,
+            subjectId: sub.id,
+            subjectName: sub.name,
+            subjectCode: sub.code,
+            studentId: stu.id,
+            studentName: stu.fullName,
+            nilaiAkhir: score,
+            predikat: pred,
+            teacherName: sub.teacherName || 'Guru Mata Pelajaran',
+            actorRole: 'guru',
+            message: `${sub.teacherName || 'Guru Mapel'} menginput nilai ${sub.name} untuk ${stu.fullName} (${score.toFixed(1)})`,
+            createdAt: row.updated_at || new Date().toISOString(),
+            read: false,
+          },
+          true
+        );
+
+        if (token && user && user.role !== 'guru') {
+          loadSchoolStateFromServer(token, user.role).catch(() => {});
+        }
+      },
+      onStatusChange: (status) => {
+        setRealtimeStatus(status);
+      },
+    });
+
+    if (currentUser.role !== 'guru') {
+      fetchRecentSupabaseNotifications(client, 25)
+        .then((items) => {
+          items.reverse().forEach((item) => pushIncomingNotification(item, false));
+        })
+        .catch(() => {});
+    }
+
+    return () => {
+      unsubscribe();
+    };
+  }, [currentUser?.id, supabaseConfigSource, connectionMode]);
+
+  // Debounced Auto-Save to LocalStorage + Multi-Teacher Server Sync + Supabase Sync
   useEffect(() => {
     if (isFirstRender.current) {
       isFirstRender.current = false;
       return;
+    }
+
+    const shouldSkipRemoteSync = skipNextRemoteSyncRef.current;
+    if (shouldSkipRemoteSync) {
+      skipNextRemoteSyncRef.current = false;
     }
 
     setSyncStatus('syncing');
@@ -406,6 +675,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setLastSavedAt(
           new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
         );
+
+        if (authToken && currentUser && !shouldSkipRemoteSync) {
+          const remoteBody: Partial<PersistedState> = {
+            grades,
+            gradeSubmissions,
+            subjects,
+          };
+          if (currentUser.role === 'wali_kelas' || currentUser.role === 'admin') {
+            remoteBody.homeroomRecords = homeroomRecords;
+          }
+          if (currentUser.role === 'admin') {
+            remoteBody.settings = settings;
+            remoteBody.classes = classes;
+            remoteBody.students = students;
+          }
+          await fetch('/api/school-state', {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${authToken}`,
+            },
+            body: JSON.stringify(remoteBody),
+          }).catch(() => {});
+        }
 
         const client = getSupabaseClient();
         if (client && connectionMode === 'supabase') {
@@ -454,6 +747,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     homeroomRecords,
     gradeSubmissions,
     connectionMode,
+    authToken,
+    currentUser,
   ]);
 
   const updateSettings = (next: SchoolSettings) => {
@@ -506,6 +801,51 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         )
         .then(() => {});
     }
+
+    // Debounced Supabase Realtime notification when Guru inputs/updates a student's grade
+    if (client && grade.nilaiAkhir > 0) {
+      const debounceKey = `${grade.studentId}__${grade.subjectId}`;
+      const existingTimer = gradeNotifyTimersRef.current.get(debounceKey);
+      if (existingTimer) window.clearTimeout(existingTimer);
+
+      const timer = window.setTimeout(() => {
+        gradeNotifyTimersRef.current.delete(debounceKey);
+        const {
+          students: stuList,
+          subjects: subList,
+          classes: clsList,
+          currentUser: activeUser,
+        } = latestDataRef.current;
+        const stu = stuList.find((s) => s.id === grade.studentId);
+        const sub = subList.find((s) => s.id === grade.subjectId);
+        if (!stu || !sub) return;
+        const cls = clsList.find((c) => c.id === stu.classId);
+        const actorName = activeUser?.fullName || sub.teacherName || 'Guru Mata Pelajaran';
+        const actorRole = activeUser?.role || 'guru';
+
+        publishGradeRealtimeNotification(client, {
+          id: `rt-${stu.id}-${sub.id}-${Date.now()}`,
+          type: 'single_grade',
+          classId: stu.classId,
+          className: cls?.name || stu.classId,
+          subjectId: sub.id,
+          subjectName: sub.name,
+          subjectCode: sub.code,
+          studentId: stu.id,
+          studentName: stu.fullName,
+          nilaiAkhir: grade.nilaiAkhir,
+          predikat: grade.predikat,
+          teacherId: activeUser?.id,
+          teacherName: actorName,
+          actorRole,
+          message: `${actorName} menginput nilai ${sub.name} untuk ${stu.fullName} (Nilai Akhir: ${grade.nilaiAkhir.toFixed(1)} · ${grade.predikat})`,
+          createdAt: new Date().toISOString(),
+          read: false,
+        }).catch(() => {});
+      }, 1200);
+
+      gradeNotifyTimersRef.current.set(debounceKey, timer);
+    }
   };
 
   const bulkUpsertGrades = (incoming: SubjectGrade[]) => {
@@ -515,6 +855,53 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       incoming.forEach((g) => map.set(`${g.studentId}__${g.subjectId}`, g));
       return Array.from(map.values());
     });
+
+    const client = getSupabaseClient();
+    if (client && incoming.length > 0) {
+      const {
+        students: stuList,
+        subjects: subList,
+        classes: clsList,
+        currentUser: activeUser,
+      } = latestDataRef.current;
+      const groups = new Map<string, { classId: string; subjectId: string; count: number }>();
+
+      incoming.forEach((g) => {
+        if (g.nilaiAkhir <= 0) return;
+        const stu = stuList.find((s) => s.id === g.studentId);
+        if (!stu) return;
+        const key = `${stu.classId}__${g.subjectId}`;
+        const prev = groups.get(key);
+        groups.set(key, {
+          classId: stu.classId,
+          subjectId: g.subjectId,
+          count: (prev?.count || 0) + 1,
+        });
+      });
+
+      groups.forEach(({ classId, subjectId, count }) => {
+        const cls = clsList.find((c) => c.id === classId);
+        const sub = subList.find((s) => s.id === subjectId);
+        if (!cls || !sub) return;
+        const actorName = activeUser?.fullName || sub.teacherName || 'Guru Mata Pelajaran';
+        publishGradeRealtimeNotification(client, {
+          id: `rt-batch-${classId}-${subjectId}-${Date.now()}`,
+          type: 'batch_grade',
+          classId,
+          className: cls.name,
+          subjectId,
+          subjectName: sub.name,
+          subjectCode: sub.code,
+          studentCount: count,
+          teacherId: activeUser?.id,
+          teacherName: actorName,
+          actorRole: activeUser?.role || 'guru',
+          message: `${actorName} memperbarui nilai ${sub.name} untuk ${count} siswa kelas ${cls.name}`,
+          createdAt: new Date().toISOString(),
+          read: false,
+        }).catch(() => {});
+      });
+    }
   };
 
   const upsertHomeroomRecord = (record: HomeroomRecord) => {
@@ -607,41 +994,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       note: note?.trim() || existing?.note,
       updatedAt: now,
     });
-  };
 
-  const loginWithRoleDemo = async (
-    role: UserRole,
-    userId?: string
-  ): Promise<{ ok: boolean; error?: string }> => {
-    try {
-      const res = await fetch('/api/auth/demo-login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role, userId }),
-      });
-      const data = (await res.json()) as {
-        token?: string;
-        user?: AuthUserSummary;
-        isDemo?: boolean;
-        error?: string;
-      };
-      if (!res.ok || !data.token || !data.user) {
-        return {
-          ok: false,
-          error: data.error || 'Mode simulasi peran tidak tersedia.',
-        };
+    const client = getSupabaseClient();
+    if (client) {
+      const cls = classes.find((c) => c.id === classId);
+      const sub = subjects.find((s) => s.id === subjectId);
+      const actorName = currentUser?.fullName || sub?.teacherName || 'Guru Mata Pelajaran';
+      if (cls && sub) {
+        publishGradeRealtimeNotification(client, {
+          id: `rt-sent-${classId}-${subjectId}-${Date.now()}`,
+          type: 'submission_sent',
+          classId,
+          className: cls.name,
+          subjectId,
+          subjectName: sub.name,
+          subjectCode: sub.code,
+          teacherId: currentUser?.id,
+          teacherName: actorName,
+          actorRole: currentUser?.role || 'guru',
+          message: `${actorName} mengirim nilai final ${sub.name} kelas ${cls.name} ke Wali Kelas`,
+          createdAt: now,
+          read: false,
+        }).catch(() => {});
       }
-      setAuthToken(data.token);
-      setCurrentUser(data.user);
-      setIsDemoSession(true);
-      applyAuthenticatedFocus(data.user);
-      await fetchAuthorizedUsers(data.token);
-      return { ok: true };
-    } catch {
-      return {
-        ok: false,
-        error: 'Gagal menghubungi server autentikasi.',
-      };
     }
   };
 
@@ -670,7 +1045,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             isActive: true,
           };
           setCurrentUser(mapped);
-          setIsDemoSession(false);
           setConnectionMode('supabase');
           setSyncStatus('connected');
           applyAuthenticatedFocus(mapped);
@@ -696,10 +1070,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           error: data.error || 'Email atau kata sandi tidak sesuai.',
         };
       }
+      const synced = await loadSchoolStateFromServer(data.token, data.user.role);
       setAuthToken(data.token);
       setCurrentUser(data.user);
-      setIsDemoSession(false);
-      applyAuthenticatedFocus(data.user);
+      applyAuthenticatedFocus(data.user, synced.subjects, synced.classes);
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
     } catch {
@@ -707,6 +1081,50 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         ok: false,
         error: 'Gagal menghubungi server login. Pastikan server berjalan.',
       };
+    }
+  };
+
+  const registerTeacherAccount = async (payload: {
+    email: string;
+    fullName: string;
+    nipNuptk?: string;
+    role: 'guru' | 'wali_kelas';
+    assignedClassId?: string;
+    password: string;
+  }): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = (await res.json()) as {
+        token?: string;
+        user?: AuthUserSummary;
+        error?: string;
+      };
+      if (!res.ok || !data.token || !data.user) {
+        return { ok: false, error: data.error || 'Gagal mendaftarkan akun guru.' };
+      }
+      const synced = await loadSchoolStateFromServer(data.token, data.user.role);
+      const registered = data.user;
+      if (registered.role === 'wali_kelas' && registered.assignedClassId) {
+        setClasses((prev) =>
+          prev.map((c) =>
+            c.id === registered.assignedClassId
+              ? { ...c, homeroomTeacherId: registered.id }
+              : c
+          )
+        );
+      }
+      setAuthToken(data.token);
+      setCurrentUser(registered);
+      applyAuthenticatedFocus(registered, synced.subjects, synced.classes);
+      await refreshAuthStatus();
+      await fetchAuthorizedUsers(data.token);
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Gagal menghubungi server pendaftaran.' };
     }
   };
 
@@ -730,10 +1148,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (!res.ok || !data.token || !data.user) {
         return { ok: false, error: data.error || 'Gagal mengklaim akun Admin.' };
       }
+      const synced = await loadSchoolStateFromServer(data.token, data.user.role);
       setAuthToken(data.token);
       setCurrentUser(data.user);
-      setIsDemoSession(false);
-      applyAuthenticatedFocus(data.user);
+      applyAuthenticatedFocus(data.user, synced.subjects, synced.classes);
       await refreshAuthStatus();
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
@@ -887,7 +1305,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       await client.auth.signOut().catch(() => {});
     }
     setAuthToken(null);
-    setIsDemoSession(false);
     setCurrentUser(null);
   };
 
@@ -946,11 +1363,61 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  const dismissToastNotification = () => {
+    setLatestToastNotification(null);
+  };
+
+  const markNotificationRead = (id: string) => {
+    readNotifIdsRef.current.add(id);
+    saveReadNotificationIds(readNotifIdsRef.current);
+    setNotifications((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, read: true } : n))
+    );
+    if (latestToastNotification?.id === id) {
+      setLatestToastNotification(null);
+    }
+  };
+
+  const markAllNotificationsRead = () => {
+    setNotifications((prev) => {
+      prev.forEach((n) => readNotifIdsRef.current.add(n.id));
+      saveReadNotificationIds(readNotifIdsRef.current);
+      return prev.map((n) => ({ ...n, read: true }));
+    });
+    setLatestToastNotification(null);
+  };
+
+  const clearNotifications = () => {
+    setNotifications((prev) => {
+      prev.forEach((n) => readNotifIdsRef.current.add(n.id));
+      saveReadNotificationIds(readNotifIdsRef.current);
+      return [];
+    });
+    setLatestToastNotification(null);
+  };
+
+  const visibleNotifications = useMemo(() => {
+    if (!currentUser || currentUser.role === 'guru') return [];
+    if (currentUser.role === 'wali_kelas') {
+      const waliClassId =
+        currentUser.assignedClassId ||
+        classes.find((c) => c.homeroomTeacherId === currentUser.id)?.id;
+      if (waliClassId) {
+        return notifications.filter((n) => n.classId === waliClassId);
+      }
+    }
+    return notifications;
+  }, [notifications, currentUser, classes]);
+
+  const unreadNotificationCount = useMemo(
+    () => visibleNotifications.filter((n) => !n.read).length,
+    [visibleNotifications]
+  );
+
   return (
     <AppContext.Provider
       value={{
         currentUser,
-        isDemoSession,
         authStatus,
         refreshAuthStatus,
         activeTab,
@@ -981,8 +1448,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         grades,
         homeroomRecords,
         gradeSubmissions,
-        loginWithRoleDemo,
         loginWithEmailPassword,
+        registerTeacherAccount,
         claimFirstAdmin,
         changeOwnPassword,
         createUserAccount,
@@ -1004,6 +1471,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         resetDemoData,
         configureSupabase,
         disconnectSupabase,
+        notifications: visibleNotifications,
+        unreadNotificationCount,
+        realtimeStatus,
+        latestToastNotification,
+        dismissToastNotification,
+        markNotificationRead,
+        markAllNotificationsRead,
+        clearNotifications,
       }}
     >
       {children}
