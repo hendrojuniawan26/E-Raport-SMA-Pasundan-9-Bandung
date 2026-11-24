@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { ChevronLeft, ChevronRight, FileText, Printer, Users } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Eye, FileText, Printer, Users } from 'lucide-react';
 import { ReportPaperSize, useApp } from '../context/AppContext';
 import {
   getRaportSubjectGroup,
@@ -7,6 +7,11 @@ import {
   Student,
 } from '../types/raport';
 import { recalculateSubjectGrade } from '../utils/gradeCalculator';
+import {
+  DEFAULT_PRINT_MARGINS,
+  PrintMarginsMm,
+  PrintPreviewModal,
+} from './PrintPreviewModal';
 import { SchoolCrest } from './SchoolCrest';
 
 export function ReportCardView() {
@@ -26,6 +31,8 @@ export function ReportCardView() {
 
   const [selectedStudentId, setSelectedStudentId] = useState<string>('stu-1');
   const [printAllMode, setPrintAllMode] = useState<boolean>(false);
+  const [previewModalOpen, setPreviewModalOpen] = useState<boolean>(false);
+  const [printMargins, setPrintMargins] = useState<PrintMarginsMm>(DEFAULT_PRINT_MARGINS);
 
   const selectedClass = classes.find((c) => c.id === focusedClassId) || classes[0];
   const classStudents = useMemo(
@@ -54,14 +61,21 @@ export function ReportCardView() {
       ? [activeStudent]
       : [];
 
-  const handlePrint = (all: boolean) => {
-    setPrintAllMode(all);
+  const triggerBrowserPrint = () => {
     window.setTimeout(() => {
       window.print();
     }, 120);
   };
 
-  const renderSingleRaport = (student: Student) => {
+  const handlePrint = (all: boolean) => {
+    setPrintAllMode(all);
+    triggerBrowserPrint();
+  };
+
+  const renderSingleRaport = (
+    student: Student,
+    options?: { inModal?: boolean; showMarginGuide?: boolean }
+  ) => {
     const hr = homeroomRecords.find((h) => h.studentId === student.id);
 
     const buildRows = (group: 'Umum' | 'Pilihan' | 'Muatan Lokal') =>
@@ -97,11 +111,8 @@ export function ReportCardView() {
         ? 'max-w-[215mm] min-h-[330mm] print:min-h-0'
         : 'max-w-[210mm] min-h-[297mm] print:min-h-0';
 
-    return (
-      <article
-        key={student.id}
-        className={`raport-page bg-white border border-slate-300 shadow-xs mx-auto w-full ${paperPageClass} p-8 sm:p-10 text-slate-900 transition-all`}
-      >
+    const innerContent = (
+      <>
         {/* KOP SURAT RESMI SMA PASUNDAN 9 BANDUNG */}
         <div className="flex items-center gap-4 pb-3 border-b-[3px] border-double border-slate-900">
           <SchoolCrest src={settings.logoUrl} className="w-16 h-16 shrink-0" />
@@ -502,6 +513,26 @@ export function ReportCardView() {
             </p>
           </div>
         </div>
+      </>
+    );
+
+    return (
+      <article
+        key={`${options?.inModal ? 'modal-' : ''}${student.id}`}
+        style={{
+          padding: `${printMargins.top}mm ${printMargins.right}mm ${printMargins.bottom}mm ${printMargins.left}mm`,
+        }}
+        className={`raport-page bg-white border border-slate-300 ${
+          options?.inModal ? 'shadow-md' : 'shadow-xs'
+        } mx-auto w-full ${paperPageClass} text-slate-900 transition-all`}
+      >
+        {options?.showMarginGuide ? (
+          <div className="border border-dashed border-sky-400/60 p-0.5 min-h-full">
+            {innerContent}
+          </div>
+        ) : (
+          innerContent
+        )}
       </article>
     );
   };
@@ -524,12 +555,12 @@ export function ReportCardView() {
 
   return (
     <div className="space-y-5">
-      {/* Dynamic @page size for selected paper (A4 or F4 / Folio) */}
+      {/* Dynamic @page size and margins for selected paper (A4 or F4 / Folio) */}
       <style>{`
         @media print {
           @page {
             size: ${pageDimensionsCss};
-            margin: 12mm 14mm;
+            margin: ${printMargins.top}mm ${printMargins.right}mm ${printMargins.bottom}mm ${printMargins.left}mm;
           }
         }
       `}</style>
@@ -635,6 +666,16 @@ export function ReportCardView() {
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            onClick={() => setPreviewModalOpen(true)}
+            disabled={classStudents.length === 0}
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
+          >
+            <Eye className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Pratinjau Cetak & Margin</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => handlePrint(false)}
             disabled={!activeStudent}
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
@@ -655,18 +696,21 @@ export function ReportCardView() {
         </div>
       </div>
 
-      {/* Active Paper Indicator */}
-      <div className="no-print flex items-center justify-between text-xs text-slate-500 px-1">
+      {/* Active Paper & Margin Indicator */}
+      <div className="no-print flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 px-1">
         <span>
           Pratinjau dokumen aktif:{' '}
           <strong className="text-slate-800">
             {reportPaperSize === 'F4'
               ? 'F4 / Folio (215 × 330 mm)'
               : 'A4 Standar (210 × 297 mm)'}
-          </strong>
+          </strong>{' '}
+          <span className="font-mono tabular-nums text-slate-500">
+            · Margin {printMargins.top}/{printMargins.right}/{printMargins.bottom}/{printMargins.left} mm
+          </span>
         </span>
         <span className="hidden sm:inline">
-          Pastikan ukuran kertas pada dialog cetak browser / PDF sesuai pilihan ({reportPaperSize}).
+          Gunakan &ldquo;Pratinjau Cetak &amp; Margin&rdquo; untuk menyesuaikan ukuran kertas A4/F4 dan margin sebelum mencetak.
         </span>
       </div>
 
@@ -680,6 +724,27 @@ export function ReportCardView() {
           {studentsToRender.map((stu) => renderSingleRaport(stu))}
         </div>
       )}
+
+      {/* Dedicated Print Preview Modal */}
+      <PrintPreviewModal
+        open={previewModalOpen}
+        onClose={() => setPreviewModalOpen(false)}
+        paperSize={reportPaperSize}
+        onChangePaperSize={setReportPaperSize}
+        margins={printMargins}
+        onChangeMargins={setPrintMargins}
+        printAllMode={printAllMode}
+        onChangePrintAllMode={setPrintAllMode}
+        activeStudentName={activeStudent?.fullName}
+        classNameLabel={selectedClass.name}
+        totalClassStudents={classStudents.length}
+        onTriggerPrint={triggerBrowserPrint}
+        renderPages={({ showMarginGuide }) =>
+          studentsToRender.map((stu) =>
+            renderSingleRaport(stu, { inModal: true, showMarginGuide })
+          )
+        }
+      />
     </div>
   );
 }

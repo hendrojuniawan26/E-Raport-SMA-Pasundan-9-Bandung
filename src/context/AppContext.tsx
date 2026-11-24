@@ -143,6 +143,8 @@ export interface AuthSystemStatus {
   adminClaimed: boolean;
   envPasscodeConfigured: boolean;
   usersCount: number;
+  serverReachable?: boolean;
+  statusChecked?: boolean;
 }
 
 interface AppContextValue {
@@ -258,6 +260,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     adminClaimed: false,
     envPasscodeConfigured: false,
     usersCount: INITIAL_USERS.length,
+    serverReachable: true,
+    statusChecked: false,
   });
   const [activeTab, setActiveTabState] = useState<ActiveTab>('dashboard');
   const [guruSubTab, setGuruSubTab] = useState<GuruSubTab>('olah_nilai');
@@ -375,15 +379,67 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const refreshAuthStatus = async () => {
+  const safeParseAuthResponse = async <T extends object>(
+    res: Response
+  ): Promise<{ ok: boolean; status: number; data?: T; rawError?: string }> => {
+    const text = await res.text();
     try {
-      const res = await fetch('/api/auth/status');
-      if (res.ok) {
-        const data = (await res.json()) as AuthSystemStatus;
-        setAuthStatus(data);
-      }
+      const parsed = JSON.parse(text) as T;
+      return { ok: res.ok, status: res.status, data: parsed };
     } catch {
-      // ignore if backend status endpoint unreachable during static preview
+      if (res.status === 404) {
+        return {
+          ok: false,
+          status: res.status,
+          rawError:
+            'Layanan backend (/api) tidak ditemukan di URL ini (404). Jika Anda membuka Shared/Static URL, pastikan aplikasi dibuka melalui Development URL atau sudah dipublikasikan dengan server aktif.',
+        };
+      }
+      if (res.status >= 500) {
+        return {
+          ok: false,
+          status: res.status,
+          rawError: `Server sedang memulai ulang atau sibuk (HTTP ${res.status}). Tunggu beberapa detik lalu coba lagi.`,
+        };
+      }
+      return {
+        ok: false,
+        status: res.status,
+        rawError: 'Respon server bukan JSON yang valid. Pastikan server Express berjalan di port 3000.',
+      };
+    }
+  };
+
+  const refreshAuthStatus = async () => {
+    const attempt = async (): Promise<boolean> => {
+      try {
+        const res = await fetch('/api/auth/status');
+        const parsed = await safeParseAuthResponse<AuthSystemStatus>(res);
+        if (parsed.ok && parsed.data) {
+          setAuthStatus({
+            ...parsed.data,
+            serverReachable: true,
+            statusChecked: true,
+          });
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    };
+
+    const okFirst = await attempt();
+    if (okFirst) return;
+
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const okRetry = await attempt();
+    if (!okRetry) {
+      setAuthStatus((prev) => ({
+        ...prev,
+        serverReachable: false,
+        statusChecked: true,
+      }));
     }
   };
 
@@ -1059,12 +1115,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
-      const data = (await res.json()) as {
+      const parsed = await safeParseAuthResponse<{
         token?: string;
         user?: AuthUserSummary;
         error?: string;
-      };
-      if (!res.ok || !data.token || !data.user) {
+      }>(res);
+      if (parsed.rawError) {
+        return { ok: false, error: parsed.rawError };
+      }
+      const data = parsed.data || {};
+      if (!parsed.ok || !data.token || !data.user) {
         return {
           ok: false,
           error: data.error || 'Email atau kata sandi tidak sesuai.',
@@ -1079,7 +1139,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     } catch {
       return {
         ok: false,
-        error: 'Gagal menghubungi server login. Pastikan server berjalan.',
+        error:
+          'Tidak dapat terhubung ke server autentikasi. Pastikan server berjalan atau coba muat ulang halaman.',
       };
     }
   };
@@ -1098,12 +1159,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = (await res.json()) as {
+      const parsed = await safeParseAuthResponse<{
         token?: string;
         user?: AuthUserSummary;
         error?: string;
-      };
-      if (!res.ok || !data.token || !data.user) {
+      }>(res);
+      if (parsed.rawError) {
+        return { ok: false, error: parsed.rawError };
+      }
+      const data = parsed.data || {};
+      if (!parsed.ok || !data.token || !data.user) {
         return { ok: false, error: data.error || 'Gagal mendaftarkan akun guru.' };
       }
       const synced = await loadSchoolStateFromServer(data.token, data.user.role);
@@ -1124,7 +1189,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
     } catch {
-      return { ok: false, error: 'Gagal menghubungi server pendaftaran.' };
+      return { ok: false, error: 'Tidak dapat terhubung ke server pendaftaran.' };
     }
   };
 
@@ -1140,12 +1205,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = (await res.json()) as {
+      const parsed = await safeParseAuthResponse<{
         token?: string;
         user?: AuthUserSummary;
         error?: string;
-      };
-      if (!res.ok || !data.token || !data.user) {
+      }>(res);
+      if (parsed.rawError) {
+        return { ok: false, error: parsed.rawError };
+      }
+      const data = parsed.data || {};
+      if (!parsed.ok || !data.token || !data.user) {
         return { ok: false, error: data.error || 'Gagal mengklaim akun Admin.' };
       }
       const synced = await loadSchoolStateFromServer(data.token, data.user.role);
@@ -1156,7 +1225,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       await fetchAuthorizedUsers(data.token);
       return { ok: true };
     } catch {
-      return { ok: false, error: 'Gagal menghubungi server aktivasi Admin.' };
+      return { ok: false, error: 'Tidak dapat terhubung ke server aktivasi Admin.' };
     }
   };
 

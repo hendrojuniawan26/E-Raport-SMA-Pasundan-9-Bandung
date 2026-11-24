@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  AlertTriangle,
   ArrowRight,
   BookOpen,
   Calculator,
@@ -10,6 +11,7 @@ import {
   Layers,
   Lock,
   Printer,
+  RefreshCw,
   ShieldCheck,
   UserCheck,
   UserPlus,
@@ -20,6 +22,7 @@ import { SchoolCrest } from './SchoolCrest';
 export function AuthScreen() {
   const {
     authStatus,
+    refreshAuthStatus,
     loginWithEmailPassword,
     registerTeacherAccount,
     claimFirstAdmin,
@@ -52,7 +55,11 @@ export function AuthScreen() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const canClaimAdmin = !authStatus.adminClaimed && !authStatus.envPasscodeConfigured;
+  const canClaimAdmin =
+    Boolean(authStatus.statusChecked) &&
+    authStatus.serverReachable !== false &&
+    !authStatus.adminClaimed &&
+    !authStatus.envPasscodeConfigured;
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -245,6 +252,28 @@ export function AuthScreen() {
               </p>
             </div>
           </div>
+
+          {authStatus.statusChecked && authStatus.serverReachable === false && (
+            <div className="mb-4 p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-semibold">Server autentikasi belum merespons</div>
+                  <p className="text-amber-800/90 mt-0.5 leading-relaxed">
+                    Pastikan Anda mengakses aplikasi melalui Development/Server URL yang aktif (bukan halaman statis tanpa backend), atau tunggu beberapa detik jika server sedang restart.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => refreshAuthStatus()}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold text-amber-900 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg shrink-0"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Coba Lagi</span>
+              </button>
+            </div>
+          )}
 
           <div className="inline-flex flex-wrap p-1 bg-slate-100 rounded-xl border border-slate-200 mb-5 self-start">
             <button

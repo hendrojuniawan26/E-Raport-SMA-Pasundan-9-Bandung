@@ -986,6 +986,19 @@ async function startServer() {
     res.json({ ok: true, updatedAt: saved.updatedAt });
   });
 
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Endpoint API tidak ditemukan.' });
+  });
+
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/api')) {
+      const message = err instanceof Error ? err.message : 'Terjadi kesalahan pada server.';
+      res.status(500).json({ error: message });
+      return;
+    }
+    next(err);
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

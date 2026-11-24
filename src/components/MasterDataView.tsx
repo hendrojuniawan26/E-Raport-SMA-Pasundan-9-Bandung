@@ -36,9 +36,9 @@ import { DEFAULT_SCHOOL_LOGO, SchoolCrest } from './SchoolCrest';
 type MasterTab = 'siswa' | 'kelas_mapel' | 'akun_role' | 'bobot_sekolah' | 'supabase_setup';
 
 const SQL_SNIPPET = `-- Jalankan di Supabase SQL Editor (Project -> SQL Editor -> New Query)
--- File lengkap tersedia pada /supabase/schema.sql di repositori proyek.
+-- Aman dijalankan ulang (idempotent). File lengkap ada di /supabase/schema.sql.
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; EXCEPTION WHEN OTHERS THEN null; END $$;
 DO $$ BEGIN CREATE TYPE public.user_role AS ENUM ('admin', 'guru', 'wali_kelas'); EXCEPTION WHEN duplicate_object THEN null; END $$;
 DO $$ BEGIN CREATE TYPE public.gender_type AS ENUM ('L', 'P'); EXCEPTION WHEN duplicate_object THEN null; END $$;
 
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS public.profiles (
 );
 
 CREATE TABLE IF NOT EXISTS public.school_settings (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   yayasan TEXT NOT NULL DEFAULT 'YAYASAN PENDIDIKAN DASAR DAN MENENGAH PASUNDAN',
   school_name TEXT NOT NULL DEFAULT 'SMA PASUNDAN 9 BANDUNG',
   npsn TEXT NOT NULL DEFAULT '20219784',
@@ -76,39 +76,45 @@ CREATE TABLE IF NOT EXISTS public.school_settings (
   weight_proses INTEGER NOT NULL DEFAULT 10,
   weight_tugas INTEGER NOT NULL DEFAULT 20,
   auto_prk_formula BOOLEAN NOT NULL DEFAULT TRUE,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS public.classes (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL UNIQUE,
   grade_level INTEGER NOT NULL CHECK (grade_level IN (10, 11, 12)),
   fase TEXT NOT NULL CHECK (fase IN ('E', 'F')),
   homeroom_teacher_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
-  academic_year TEXT NOT NULL DEFAULT '2025/2026'
+  academic_year TEXT NOT NULL DEFAULT '2025/2026',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS public.subjects (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   code TEXT NOT NULL,
   name TEXT NOT NULL,
   category TEXT NOT NULL DEFAULT 'Umum',
+  fase_scope TEXT NOT NULL DEFAULT 'ALL',
+  class_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
   kktp INTEGER NOT NULL DEFAULT 70,
   teacher_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
-  sort_order INTEGER NOT NULL DEFAULT 1
+  sort_order INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS public.learning_objectives (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   subject_id UUID NOT NULL REFERENCES public.subjects(id) ON DELETE CASCADE,
   code TEXT NOT NULL,
   title TEXT NOT NULL,
   is_sas BOOLEAN NOT NULL DEFAULT FALSE,
-  sort_order INTEGER NOT NULL DEFAULT 1
+  sort_order INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS public.students (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   nis TEXT UNIQUE NOT NULL,
   nisn TEXT DEFAULT '',
   full_name TEXT NOT NULL,
@@ -120,11 +126,12 @@ CREATE TABLE IF NOT EXISTS public.students (
   address TEXT DEFAULT '',
   parent_name TEXT DEFAULT '',
   photo_url TEXT,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS public.student_grades (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE CASCADE,
   subject_id UUID NOT NULL REFERENCES public.subjects(id) ON DELETE CASCADE,
   academic_year TEXT NOT NULL DEFAULT '2025/2026',
@@ -145,7 +152,7 @@ CREATE TABLE IF NOT EXISTS public.student_grades (
 );
 
 CREATE TABLE IF NOT EXISTS public.homeroom_records (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE CASCADE,
   academic_year TEXT NOT NULL DEFAULT '2025/2026',
   semester TEXT NOT NULL DEFAULT 'Ganjil',
@@ -153,7 +160,7 @@ CREATE TABLE IF NOT EXISTS public.homeroom_records (
   izin INTEGER NOT NULL DEFAULT 0,
   alpha INTEGER NOT NULL DEFAULT 0,
   wali_note TEXT DEFAULT '',
-  promotion_status TEXT DEFAULT 'Melanjutkan ke Semester Genap',
+  promotion_status TEXT DEFAULT 'Naik ke kelas berikutnya',
   extracurriculars JSONB NOT NULL DEFAULT '[]'::jsonb,
   p5_projects JSONB NOT NULL DEFAULT '[]'::jsonb,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -181,11 +188,25 @@ CREATE TABLE IF NOT EXISTS public.grade_notifications (
 );
 
 ALTER TABLE public.grade_notifications ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Grade notifications readable" ON public.grade_notifications FOR SELECT TO authenticated, anon USING (true);
-CREATE POLICY "Grade notifications insertable" ON public.grade_notifications FOR INSERT TO authenticated, anon WITH CHECK (true);
+DROP POLICY IF EXISTS "Grade notifications readable by staff" ON public.grade_notifications;
+DROP POLICY IF EXISTS "Grade notifications readable" ON public.grade_notifications;
+CREATE POLICY "Grade notifications readable by staff" ON public.grade_notifications FOR SELECT TO authenticated, anon USING (true);
+DROP POLICY IF EXISTS "Grade notifications insertable by staff" ON public.grade_notifications;
+DROP POLICY IF EXISTS "Grade notifications insertable" ON public.grade_notifications;
+CREATE POLICY "Grade notifications insertable by staff" ON public.grade_notifications FOR INSERT TO authenticated, anon WITH CHECK (true);
 
-DO $$ BEGIN ALTER PUBLICATION supabase_realtime ADD TABLE public.student_grades; EXCEPTION WHEN duplicate_object THEN null; END $$;
-DO $$ BEGIN ALTER PUBLICATION supabase_realtime ADD TABLE public.grade_notifications; EXCEPTION WHEN duplicate_object THEN null; END $$;`;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime' AND NOT puballtables) THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'student_grades') THEN
+      ALTER PUBLICATION supabase_realtime ADD TABLE public.student_grades;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'grade_notifications') THEN
+      ALTER PUBLICATION supabase_realtime ADD TABLE public.grade_notifications;
+    END IF;
+  END IF;
+EXCEPTION WHEN OTHERS THEN null;
+END $$;`;
 
 export function MasterDataView() {
   const {
