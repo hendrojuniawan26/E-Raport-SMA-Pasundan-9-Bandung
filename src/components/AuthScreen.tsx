@@ -29,8 +29,10 @@ export function AuthScreen() {
     claimFirstAdmin,
     settings,
     connectionMode,
+    supabaseConfigSource,
     supabaseEmailDisabled,
     recheckSupabaseHealth,
+    configureSupabase,
   } = useApp();
 
   const [authTab, setAuthTab] = useState<'login' | 'claim_admin'>('login');
@@ -49,6 +51,12 @@ export function AuthScreen() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [checkingSupabase, setCheckingSupabase] = useState(false);
+  const [showSupabaseSetup, setShowSupabaseSetup] = useState(false);
+  const [sbUrlInput, setSbUrlInput] = useState(() => getSupabaseConfig().url);
+  const [sbAnonInput, setSbAnonInput] = useState(() => getSupabaseConfig().anonKey);
+  const [showSbAnon, setShowSbAnon] = useState(false);
+  const [savingSb, setSavingSb] = useState(false);
+  const [sbSetupFeedback, setSbSetupFeedback] = useState<{ ok: boolean; text: string } | null>(null);
 
   const supabaseCfg = getSupabaseConfig();
   const isSupabaseConnected =
@@ -237,24 +245,175 @@ export function AuthScreen() {
 
           {authStatus.statusChecked && authStatus.serverReachable === false && (
             isSupabaseConnected ? (
-              <div className="mb-4 p-3.5 rounded-xl bg-sky-50 border border-sky-200 text-xs text-sky-900 flex items-start justify-between gap-3">
+              <div className="mb-4 p-3.5 rounded-xl bg-sky-50 border border-sky-200 text-xs text-sky-900 space-y-2.5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <Database className="w-4 h-4 text-sky-700 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="font-semibold">Mode Koneksi Langsung Supabase Aktif</div>
+                      <p className="text-sky-800/90 mt-0.5 leading-relaxed">
+                        Aplikasi terhubung langsung ke Supabase Cloud (
+                        {supabaseConfigSource === 'env'
+                          ? 'Environment Variables'
+                          : 'Konfigurasi Browser'}
+                        ). Masuk menggunakan akun yang telah didaftarkan Admin Sekolah.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {supabaseConfigSource === 'local' && (
+                      <button
+                        type="button"
+                        onClick={() => setShowSupabaseSetup((prev) => !prev)}
+                        className="px-2.5 py-1.5 text-[11px] font-semibold text-sky-900 bg-white border border-sky-300 hover:bg-sky-100 rounded-lg"
+                      >
+                        {showSupabaseSetup ? 'Tutup' : 'Ubah Kunci'}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={checkingSupabase}
+                      onClick={async () => {
+                        setCheckingSupabase(true);
+                        if (authStatus.apiAvailable === false) {
+                          await recheckSupabaseHealth();
+                        } else {
+                          await Promise.all([refreshAuthStatus(), recheckSupabaseHealth()]);
+                        }
+                        setCheckingSupabase(false);
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold text-sky-900 bg-white border border-sky-300 hover:bg-sky-100 rounded-lg disabled:opacity-60"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${checkingSupabase ? 'animate-spin' : ''}`} />
+                      <span>{checkingSupabase ? 'Mengecek...' : 'Cek Koneksi'}</span>
+                    </button>
+                  </div>
+                </div>
+                {showSupabaseSetup && (
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      setSavingSb(true);
+                      setSbSetupFeedback(null);
+                      const res = await configureSupabase(sbUrlInput, sbAnonInput);
+                      setSavingSb(false);
+                      setSbSetupFeedback({ ok: res.ok, text: res.message });
+                      if (res.ok) setError('');
+                    }}
+                    className="pt-2 border-t border-sky-200/80 space-y-2"
+                  >
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <input
+                        type="url"
+                        required
+                        value={sbUrlInput}
+                        onChange={(e) => setSbUrlInput(e.target.value)}
+                        placeholder="https://xyzcompany.supabase.co"
+                        className="w-full px-2.5 py-1.5 text-[11px] font-mono bg-white border border-sky-200 rounded-lg"
+                      />
+                      <div className="relative">
+                        <input
+                          type={showSbAnon ? 'text' : 'password'}
+                          required
+                          value={sbAnonInput}
+                          onChange={(e) => setSbAnonInput(e.target.value)}
+                          placeholder="Supabase Anon Public Key"
+                          className="w-full px-2.5 py-1.5 pr-8 text-[11px] font-mono bg-white border border-sky-200 rounded-lg"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowSbAnon((prev) => !prev)}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                          aria-label={showSbAnon ? 'Sembunyikan Anon Key' : 'Lihat Anon Key'}
+                        >
+                          {showSbAnon ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        </button>
+                      </div>
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={savingSb}
+                      className="px-3 py-1.5 text-[11px] font-semibold text-white bg-sky-700 hover:bg-sky-800 rounded-lg disabled:opacity-60"
+                    >
+                      {savingSb ? 'Menghubungkan...' : 'Simpan & Uji Ulang'}
+                    </button>
+                    {sbSetupFeedback && (
+                      <p className={`text-[11px] ${sbSetupFeedback.ok ? 'text-emerald-800' : 'text-amber-900'}`}>
+                        {sbSetupFeedback.text}
+                      </p>
+                    )}
+                  </form>
+                )}
+              </div>
+            ) : authStatus.apiAvailable === false ? (
+              <div className="mb-4 p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-950 space-y-2.5">
                 <div className="flex items-start gap-2.5">
-                  <Database className="w-4 h-4 text-sky-700 shrink-0 mt-0.5" />
+                  <Database className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
                   <div>
-                    <div className="font-semibold">Mode Autentikasi Langsung Supabase Aktif</div>
-                    <p className="text-sky-800/90 mt-0.5 leading-relaxed">
-                      Aplikasi terhubung ke Supabase Cloud. Masuk menggunakan akun yang telah didaftarkan dan diaktifkan oleh Admin Sekolah.
+                    <div className="font-semibold">Hubungkan Supabase (Mode Hosting Statis / Netlify)</div>
+                    <p className="text-amber-900/90 mt-0.5 leading-relaxed">
+                      Hosting statis seperti Netlify tidak menjalankan server <code className="font-mono">/api</code> lokal, dan kunci Supabase belum terdeteksi di browser ini. Masukkan URL &amp; Anon Public Key Supabase di bawah untuk langsung login.
                     </p>
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => refreshAuthStatus()}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold text-sky-900 bg-white border border-sky-300 hover:bg-sky-100 rounded-lg shrink-0"
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    setSavingSb(true);
+                    setSbSetupFeedback(null);
+                    const res = await configureSupabase(sbUrlInput, sbAnonInput);
+                    setSavingSb(false);
+                    setSbSetupFeedback({ ok: res.ok, text: res.message });
+                    if (res.ok) setError('');
+                  }}
+                  className="space-y-2 pl-6"
                 >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Cek Server</span>
-                </button>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      type="url"
+                      required
+                      value={sbUrlInput}
+                      onChange={(e) => setSbUrlInput(e.target.value)}
+                      placeholder="https://xyzcompany.supabase.co"
+                      className="w-full px-2.5 py-1.5 text-[11px] font-mono bg-white border border-amber-300 rounded-lg focus:outline-none focus:border-emerald-700"
+                    />
+                    <div className="relative">
+                      <input
+                        type={showSbAnon ? 'text' : 'password'}
+                        required
+                        value={sbAnonInput}
+                        onChange={(e) => setSbAnonInput(e.target.value)}
+                        placeholder="Supabase Anon Public Key (eyJ...)"
+                        className="w-full px-2.5 py-1.5 pr-8 text-[11px] font-mono bg-white border border-amber-300 rounded-lg focus:outline-none focus:border-emerald-700"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowSbAnon((prev) => !prev)}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                        aria-label={showSbAnon ? 'Sembunyikan Anon Key' : 'Lihat Anon Key'}
+                      >
+                        {showSbAnon ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <button
+                      type="submit"
+                      disabled={savingSb}
+                      className="px-3 py-1.5 text-[11px] font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg disabled:opacity-60"
+                    >
+                      {savingSb ? 'Menghubungkan...' : 'Hubungkan Supabase'}
+                    </button>
+                    <span className="text-[11px] text-amber-900/90">
+                      Agar otomatis di semua browser: isi <code className="font-mono">VITE_SUPABASE_URL</code> &amp; <code className="font-mono">VITE_SUPABASE_ANON_KEY</code> di Environment Variables Netlify.
+                    </span>
+                  </div>
+                  {sbSetupFeedback && (
+                    <p className={`text-[11px] ${sbSetupFeedback.ok ? 'text-emerald-800' : 'text-red-700'}`}>
+                      {sbSetupFeedback.text}
+                    </p>
+                  )}
+                </form>
               </div>
             ) : (
               <div className="mb-4 p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start justify-between gap-3">

@@ -167,6 +167,7 @@ export interface AuthSystemStatus {
   envPasscodeConfigured: boolean;
   usersCount: number;
   serverReachable?: boolean;
+  apiAvailable?: boolean;
   statusChecked?: boolean;
 }
 
@@ -373,6 +374,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const saveTimerRef = useRef<number | null>(null);
   const isFirstRender = useRef(true);
   const skipNextRemoteSyncRef = useRef(false);
+  const backendApiAvailableRef = useRef<boolean | null>(null);
   const gradeNotifyTimersRef = useRef<Map<string, number>>(new Map());
   const readNotifIdsRef = useRef<Set<string>>(loadReadNotificationIds());
   const latestDataRef = useRef({
@@ -414,7 +416,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const safeParseAuthResponse = async <T extends object>(
     res: Response
-  ): Promise<{ ok: boolean; status: number; data?: T; rawError?: string }> => {
+  ): Promise<{
+    ok: boolean;
+    status: number;
+    data?: T;
+    rawError?: string;
+    isBackendMissing?: boolean;
+  }> => {
     if (res.redirected && res.url.includes('__cookie_check')) {
       return {
         ok: false,
@@ -424,19 +432,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     }
 
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
     const text = await res.text();
+    const looksLikeHtml = !contentType.includes('application/json') && text.trim().startsWith('<');
+
+    if (res.status === 404 || looksLikeHtml) {
+      backendApiAvailableRef.current = false;
+      return {
+        ok: false,
+        status: res.status === 404 ? 404 : 404,
+        isBackendMissing: true,
+        rawError:
+          'Backend lokal (/api) tidak tersedia pada hosting ini. Aplikasi berjalan dalam mode koneksi langsung Supabase.',
+      };
+    }
+
     try {
       const parsed = JSON.parse(text) as T;
+      backendApiAvailableRef.current = true;
       return { ok: res.ok, status: res.status, data: parsed };
     } catch {
-      if (res.status === 404) {
-        return {
-          ok: false,
-          status: res.status,
-          rawError:
-            'Layanan backend (/api) tidak aktif di URL ini (404). Aplikasi berjalan di mode koneksi langsung Supabase.',
-        };
-      }
       if (res.status >= 500) {
         return {
           ok: false,
@@ -447,39 +462,53 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return {
         ok: false,
         status: res.status,
-        rawError: 'Respon server bukan JSON yang valid.',
+        isBackendMissing: true,
+        rawError: 'Backend lokal (/api) tidak merespons JSON yang valid.',
       };
     }
   };
 
   const refreshAuthStatus = async () => {
-    const attempt = async (): Promise<boolean> => {
+    const attempt = async (): Promise<{ ok: boolean; missingBackend?: boolean }> => {
       try {
         const res = await fetch('/api/auth/status', { credentials: 'same-origin' });
         const parsed = await safeParseAuthResponse<AuthSystemStatus>(res);
         if (parsed.ok && parsed.data) {
+          backendApiAvailableRef.current = true;
           setAuthStatus({
             ...parsed.data,
             serverReachable: true,
+            apiAvailable: true,
             statusChecked: true,
           });
-          return true;
+          return { ok: true };
         }
-        return false;
+        if (parsed.isBackendMissing) {
+          backendApiAvailableRef.current = false;
+          setAuthStatus((prev) => ({
+            ...prev,
+            serverReachable: false,
+            apiAvailable: false,
+            statusChecked: true,
+          }));
+          return { ok: false, missingBackend: true };
+        }
+        return { ok: false };
       } catch {
-        return false;
+        return { ok: false };
       }
     };
 
-    const okFirst = await attempt();
-    if (okFirst) return;
+    const first = await attempt();
+    if (first.ok || first.missingBackend) return;
 
     await new Promise((resolve) => setTimeout(resolve, 700));
-    const okRetry = await attempt();
-    if (!okRetry) {
+    const retry = await attempt();
+    if (!retry.ok && !retry.missingBackend) {
       setAuthStatus((prev) => ({
         ...prev,
         serverReachable: false,
+        apiAvailable: backendApiAvailableRef.current ?? undefined,
         statusChecked: true,
       }));
     }
@@ -687,14 +716,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // Check Auth Status & load shared cross-browser Supabase connectivity on mount
   useEffect(() => {
-    refreshAuthStatus();
-
     const restoreExpressSession = async () => {
+      if (backendApiAvailableRef.current === false) return false;
       try {
         const res = await fetch('/api/auth/session', {
           credentials: 'same-origin',
           headers: buildExpressHeaders(null),
         });
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        if (res.status === 404 || !contentType.includes('application/json')) {
+          backendApiAvailableRef.current = false;
+          return false;
+        }
         if (!res.ok) {
           return false;
         }
@@ -715,8 +748,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
 
     const initSupabase = async () => {
+      await refreshAuthStatus();
       await restoreExpressSession();
-      const cfg = await loadServerSupabaseConfig();
+      const cfg = await loadServerSupabaseConfig(backendApiAvailableRef.current === false);
       setSupabaseConfigSource(cfg.source);
 
       if (cfg.url && cfg.anonKey) {
@@ -795,15 +829,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     initSupabase();
   }, []);
 
-  // Auto-recover auth server reachability while on login screen if server was restarting
+  // Auto-recover auth server reachability while on login screen if Express server was restarting
   useEffect(() => {
-    if (currentUser || !authStatus.statusChecked || authStatus.serverReachable !== false) {
+    if (
+      currentUser ||
+      !authStatus.statusChecked ||
+      authStatus.serverReachable !== false ||
+      authStatus.apiAvailable === false
+    ) {
       return;
     }
     let cancelled = false;
     let attempts = 0;
     const timer = window.setInterval(async () => {
-      if (cancelled || attempts >= 5) {
+      if (cancelled || attempts >= 5 || backendApiAvailableRef.current === false) {
         window.clearInterval(timer);
         return;
       }
@@ -811,10 +850,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       try {
         const res = await fetch('/api/auth/status', { credentials: 'same-origin' });
         const parsed = await safeParseAuthResponse<AuthSystemStatus>(res);
+        if (!cancelled && parsed.isBackendMissing) {
+          backendApiAvailableRef.current = false;
+          setAuthStatus((prev) => ({
+            ...prev,
+            serverReachable: false,
+            apiAvailable: false,
+            statusChecked: true,
+          }));
+          window.clearInterval(timer);
+          return;
+        }
         if (!cancelled && parsed.ok && parsed.data) {
+          backendApiAvailableRef.current = true;
           setAuthStatus({
             ...parsed.data,
             serverReachable: true,
+            apiAvailable: true,
             statusChecked: true,
           });
           window.clearInterval(timer);
@@ -828,7 +880,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [currentUser, authStatus.statusChecked, authStatus.serverReachable]);
+  }, [currentUser, authStatus.statusChecked, authStatus.serverReachable, authStatus.apiAvailable]);
 
   // Persist notifications locally whenever updated
   useEffect(() => {
@@ -992,7 +1044,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
         );
 
-        if (currentUser && !shouldSkipRemoteSync) {
+        if (currentUser && !shouldSkipRemoteSync && backendApiAvailableRef.current !== false) {
           const remoteBody: Partial<PersistedState> = {
             grades,
             gradeSubmissions,
@@ -1436,25 +1488,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           let serverVerifiedAuth: { token: string; user: AuthUserSummary } | null = null;
           const profileRoleRaw = activeProfile?.role;
 
-          try {
-            const srvRes = await fetch('/api/auth/login', {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ email, password }),
-            });
-            const srvParsed = await safeParseAuthResponse<{
-              token?: string;
-              user?: AuthUserSummary;
-            }>(srvRes);
-            if (srvParsed.ok && srvParsed.data?.token && srvParsed.data?.user) {
-              serverVerifiedAuth = {
-                token: srvParsed.data.token,
-                user: srvParsed.data.user,
-              };
+          if (backendApiAvailableRef.current !== false) {
+            try {
+              const srvRes = await fetch('/api/auth/login', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password }),
+              });
+              const srvParsed = await safeParseAuthResponse<{
+                token?: string;
+                user?: AuthUserSummary;
+              }>(srvRes);
+              if (srvParsed.ok && srvParsed.data?.token && srvParsed.data?.user) {
+                serverVerifiedAuth = {
+                  token: srvParsed.data.token,
+                  user: srvParsed.data.user,
+                };
+              }
+            } catch {
+              // ignore if backend /api is unavailable
             }
-          } catch {
-            // ignore if backend /api is unavailable
           }
 
           if (profileRoleRaw && serverVerifiedAuth && profileRoleRaw === 'admin') {
@@ -1582,6 +1636,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    const formatSupabaseLoginFailure = (rawMsg: string): string => {
+      const lower = rawMsg.toLowerCase();
+      if (lower.includes('email logins are disabled') || lower.includes('email_provider_disabled')) {
+        setSupabaseEmailDisabled(true);
+        return 'Login Email di Supabase Auth sedang dinonaktifkan ("Email logins are disabled"). Buka Supabase Dashboard → Authentication → Providers → Email, aktifkan "Enable Email provider", lalu klik Save.';
+      }
+      if (lower.includes('email not confirmed')) {
+        return 'Email belum terkonfirmasi di Supabase Auth. Jalankan skrip SQL terbaru di Supabase SQL Editor agar semua akun langsung terkonfirmasi tanpa verifikasi email.';
+      }
+      if (lower.includes('invalid login credentials') || !rawMsg) {
+        return 'Email atau kata sandi salah, atau akun belum didaftarkan oleh Admin Sekolah.';
+      }
+      return `Gagal login melalui Supabase Auth: ${rawMsg}`;
+    };
+
+    const missingSupabaseConfigMsg =
+      'Koneksi Supabase belum terkonfigurasi di browser/hosting ini. Masukkan Supabase Project URL & Anon Public Key pada form "Hubungkan Supabase" di atas, atau tambahkan VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY di Environment Variables Netlify.';
+
+    if (backendApiAvailableRef.current === false) {
+      if (client) {
+        return { ok: false, error: formatSupabaseLoginFailure(supabaseErrorMessage) };
+      }
+      return { ok: false, error: missingSupabaseConfigMsg };
+    }
+
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
@@ -1597,24 +1676,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         user?: AuthUserSummary;
         error?: string;
       }>(res);
-      const formatSupabaseLoginFailure = (rawMsg: string): string => {
-        const lower = rawMsg.toLowerCase();
-        if (lower.includes('email logins are disabled') || lower.includes('email_provider_disabled')) {
-          setSupabaseEmailDisabled(true);
-          return 'Login Email di Supabase Auth sedang dinonaktifkan ("Email logins are disabled"). Buka Supabase Dashboard → Authentication → Providers → Email, aktifkan "Enable Email provider", lalu klik Save.';
-        }
-        if (lower.includes('email not confirmed')) {
-          return 'Email belum terkonfirmasi di Supabase Auth. Jalankan skrip SQL terbaru di Supabase SQL Editor agar semua akun langsung terkonfirmasi tanpa verifikasi email.';
-        }
-        if (lower.includes('invalid login credentials') || !rawMsg) {
-          return 'Email atau kata sandi salah, atau akun belum didaftarkan oleh Admin Sekolah.';
-        }
-        return `Gagal login melalui Supabase Auth: ${rawMsg}`;
-      };
 
       if (parsed.rawError) {
         if (client) {
           return { ok: false, error: formatSupabaseLoginFailure(supabaseErrorMessage) };
+        }
+        if (parsed.isBackendMissing) {
+          return { ok: false, error: missingSupabaseConfigMsg };
         }
         return { ok: false, error: parsed.rawError };
       }
@@ -1672,17 +1740,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return { ok: true };
     } catch {
       if (client) {
-        return {
-          ok: false,
-          error: supabaseErrorMessage
-            ? `Gagal login melalui Supabase Auth: ${supabaseErrorMessage}`
-            : 'Email atau kata sandi belum terdaftar di Supabase Auth (atau tidak cocok).',
-        };
+        return { ok: false, error: formatSupabaseLoginFailure(supabaseErrorMessage) };
       }
       return {
         ok: false,
-        error:
-          'Tidak dapat terhubung ke server autentikasi. Pastikan server berjalan atau coba muat ulang halaman.',
+        error: missingSupabaseConfigMsg,
       };
     }
   };
@@ -1750,23 +1812,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const client = getSupabaseClient();
     let expressSucceeded = false;
 
-    try {
-      const res = await fetch('/api/auth/change-password', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
-      const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
-      if (!parsed.rawError && parsed.status !== 401) {
-        const data = parsed.data || {};
-        if (!parsed.ok) {
-          return { ok: false, error: data.error || 'Gagal memperbarui kata sandi.' };
+    if (backendApiAvailableRef.current !== false) {
+      try {
+        const res = await fetch('/api/auth/change-password', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ currentPassword, newPassword }),
+        });
+        const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
+        if (!parsed.rawError && parsed.status !== 401) {
+          const data = parsed.data || {};
+          if (!parsed.ok) {
+            return { ok: false, error: data.error || 'Gagal memperbarui kata sandi.' };
+          }
+          expressSucceeded = true;
         }
-        expressSucceeded = true;
+      } catch {
+        // fall through to Supabase Auth password change if /api unreachable
       }
-    } catch {
-      // fall through to Supabase Auth password change if /api unreachable
     }
 
     if (client && currentUser?.email) {
@@ -1966,59 +2030,61 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     };
 
-    try {
-      const res = await fetch('/api/users', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify(payload),
-      });
-      const parsed = await safeParseAuthResponse<{
-        user?: AuthUserSummary;
-        supabaseConfirmed?: boolean;
-        error?: string;
-      }>(res);
-      if (!parsed.rawError && parsed.status !== 401) {
-        const data = parsed.data || {};
-        if (!parsed.ok || !data.user) {
-          return { ok: false, error: data.error || 'Gagal menambah akun pengguna.' };
-        }
-        let createdUser = data.user;
-        let warning: string | undefined;
-        if (!data.supabaseConfirmed) {
-          const sbMirror = await syncNewUserToSupabase().catch(() => null);
-          if (sbMirror?.ok && sbMirror.user) {
-            createdUser = { ...createdUser, id: sbMirror.user.id };
-          } else if (sbMirror && !sbMirror.ok && sbMirror.error) {
-            warning = `Akun aktif di Server Sekolah, namun sinkronisasi ke Supabase Auth gagal: ${sbMirror.error}`;
+    if (backendApiAvailableRef.current !== false) {
+      try {
+        const res = await fetch('/api/users', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
+          body: JSON.stringify(payload),
+        });
+        const parsed = await safeParseAuthResponse<{
+          user?: AuthUserSummary;
+          supabaseConfirmed?: boolean;
+          error?: string;
+        }>(res);
+        if (!parsed.rawError && parsed.status !== 401) {
+          const data = parsed.data || {};
+          if (!parsed.ok || !data.user) {
+            return { ok: false, error: data.error || 'Gagal menambah akun pengguna.' };
           }
-          if (sbMirror && sbMirror.ok && sbMirror.autoConfirmed === false) {
-            warning =
-              'Akun langsung aktif di Server Sekolah tanpa verifikasi email. Agar login Supabase di perangkat luar juga tanpa verifikasi email, jalankan SQL terbaru di tab Database Supabase & SQL.';
+          let createdUser = data.user;
+          let warning: string | undefined;
+          if (!data.supabaseConfirmed) {
+            const sbMirror = await syncNewUserToSupabase().catch(() => null);
+            if (sbMirror?.ok && sbMirror.user) {
+              createdUser = { ...createdUser, id: sbMirror.user.id };
+            } else if (sbMirror && !sbMirror.ok && sbMirror.error) {
+              warning = `Akun aktif di Server Sekolah, namun sinkronisasi ke Supabase Auth gagal: ${sbMirror.error}`;
+            }
+            if (sbMirror && sbMirror.ok && sbMirror.autoConfirmed === false) {
+              warning =
+                'Akun langsung aktif di Server Sekolah tanpa verifikasi email. Agar login Supabase di perangkat luar juga tanpa verifikasi email, jalankan SQL terbaru di tab Database Supabase & SQL.';
+            }
           }
-        }
-        setUsers((prev) => {
-          if (prev.some((u) => u.email.toLowerCase() === createdUser.email.toLowerCase())) {
-            return prev.map((u) =>
-              u.email.toLowerCase() === createdUser.email.toLowerCase() ? createdUser : u
+          setUsers((prev) => {
+            if (prev.some((u) => u.email.toLowerCase() === createdUser.email.toLowerCase())) {
+              return prev.map((u) =>
+                u.email.toLowerCase() === createdUser.email.toLowerCase() ? createdUser : u
+              );
+            }
+            return [...prev, createdUser];
+          });
+          if (createdUser.role === 'wali_kelas' && createdUser.assignedClassId) {
+            setClasses((prev) =>
+              prev.map((c) =>
+                c.id === createdUser.assignedClassId
+                  ? { ...c, homeroomTeacherId: createdUser.id }
+                  : c
+              )
             );
           }
-          return [...prev, createdUser];
-        });
-        if (createdUser.role === 'wali_kelas' && createdUser.assignedClassId) {
-          setClasses((prev) =>
-            prev.map((c) =>
-              c.id === createdUser.assignedClassId
-                ? { ...c, homeroomTeacherId: createdUser.id }
-                : c
-            )
-          );
+          await refreshAuthStatus();
+          return { ok: true, warning };
         }
-        await refreshAuthStatus();
-        return { ok: true, warning };
+      } catch {
+        // fall through to direct Supabase mode if /api is unreachable
       }
-    } catch {
-      // fall through to direct Supabase mode if /api is unreachable
     }
 
     const sbCreated = await syncNewUserToSupabase();
@@ -2170,25 +2236,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
 
     let expressUpdatedUser: AuthUserSummary | null = null;
-    try {
-      const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
-        method: 'PATCH',
-        credentials: 'same-origin',
-        headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify(patch),
-      });
-      const parsed = await safeParseAuthResponse<{ user?: AuthUserSummary; error?: string }>(res);
-      if (!parsed.rawError && parsed.status !== 401) {
-        const data = parsed.data || {};
-        if (!parsed.ok && parsed.status !== 404) {
-          return { ok: false, error: data.error || 'Gagal memperbarui akun.' };
+    if (backendApiAvailableRef.current !== false) {
+      try {
+        const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
+          method: 'PATCH',
+          credentials: 'same-origin',
+          headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
+          body: JSON.stringify(patch),
+        });
+        const parsed = await safeParseAuthResponse<{ user?: AuthUserSummary; error?: string }>(res);
+        if (!parsed.rawError && parsed.status !== 401) {
+          const data = parsed.data || {};
+          if (!parsed.ok && parsed.status !== 404) {
+            return { ok: false, error: data.error || 'Gagal memperbarui akun.' };
+          }
+          if (parsed.ok && data.user) {
+            expressUpdatedUser = data.user;
+          }
         }
-        if (parsed.ok && data.user) {
-          expressUpdatedUser = data.user;
-        }
+      } catch {
+        // fall through to Supabase update if /api is unreachable
       }
-    } catch {
-      // fall through to Supabase update if /api is unreachable
     }
 
     const sbRes = await syncUserPatchToSupabase();
@@ -2234,24 +2302,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
 
     let expressDeleted = false;
-    try {
-      const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
-        method: 'DELETE',
-        credentials: 'same-origin',
-        headers: buildExpressHeaders(authToken),
-      });
-      const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
-      if (!parsed.rawError && parsed.status !== 401) {
-        const data = parsed.data || {};
-        if (!parsed.ok && parsed.status !== 404) {
-          return { ok: false, error: data.error || 'Gagal menghapus akun.' };
+    if (backendApiAvailableRef.current !== false) {
+      try {
+        const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
+          method: 'DELETE',
+          credentials: 'same-origin',
+          headers: buildExpressHeaders(authToken),
+        });
+        const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
+        if (!parsed.rawError && parsed.status !== 401) {
+          const data = parsed.data || {};
+          if (!parsed.ok && parsed.status !== 404) {
+            return { ok: false, error: data.error || 'Gagal menghapus akun.' };
+          }
+          if (parsed.ok) {
+            expressDeleted = true;
+          }
         }
-        if (parsed.ok) {
-          expressDeleted = true;
-        }
+      } catch {
+        // fall through to Supabase profile delete if /api is unreachable
       }
-    } catch {
-      // fall through to Supabase profile delete if /api is unreachable
     }
 
     const client = getSupabaseClient();
@@ -2303,11 +2373,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
-    await fetch('/api/auth/logout', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'X-Requested-With': 'XMLHttpRequest' },
-    }).catch(() => {});
+    if (backendApiAvailableRef.current !== false) {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      }).catch(() => {});
+    }
     const client = getSupabaseClient();
     if (client) {
       await client.auth.signOut().catch(() => {});
@@ -2320,7 +2392,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
 
   const recheckSupabaseHealth = async () => {
-    const cfg = await loadServerSupabaseConfig();
+    const cfg = await loadServerSupabaseConfig(backendApiAvailableRef.current === false);
     setSupabaseConfigSource(cfg.source);
     if (!cfg.url || !cfg.anonKey) {
       setConnectionMode('offline');
@@ -2346,7 +2418,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const configureSupabase = async (url: string, anonKey: string) => {
     saveRuntimeSupabaseConfig(url, anonKey);
-    const remoteSave = await saveServerSupabaseConfigRemote(url, anonKey, authToken);
+    const remoteSave =
+      backendApiAvailableRef.current === false
+        ? { ok: false, staticHost: true }
+        : await saveServerSupabaseConfigRemote(url, anonKey, authToken);
     const activeCfg = getSupabaseConfig();
     setSupabaseConfigSource(activeCfg.source);
 
@@ -2356,6 +2431,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     let finalMsg = res.message;
     if (res.ok && remoteSave.ok) {
       finalMsg = `${res.message} Tersimpan permanen di server — otomatis aktif saat dibuka di browser atau perangkat lain.`;
+    } else if (res.ok && remoteSave.staticHost) {
+      finalMsg = `${res.message} Tersimpan di browser ini (Mode Hosting Statis). Agar otomatis aktif di semua browser lain, tambahkan VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY di Environment Variables Netlify.`;
     } else if (!remoteSave.ok && remoteSave.error) {
       finalMsg = `${res.message} (Catatan server: ${remoteSave.error})`;
     }

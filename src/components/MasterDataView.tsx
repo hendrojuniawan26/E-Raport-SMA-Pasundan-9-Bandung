@@ -2629,8 +2629,8 @@ export function MasterDataView() {
             </div>
 
             <p className="text-xs text-slate-500 leading-relaxed">
-              Sekali disimpan oleh Admin, URL & Anon Public Key otomatis tersinkron ke server aplikasi sehingga langsung terhubung saat dibuka di browser atau perangkat lain. Untuk deploy permanen jangka panjang, Anda juga dapat mengisi <code className="font-mono text-slate-700">VITE_SUPABASE_URL</code> dan{' '}
-              <code className="font-mono text-slate-700">VITE_SUPABASE_ANON_KEY</code> di panel Secrets / <code className="font-mono text-slate-700">.env</code>.
+              Sekali disimpan oleh Admin pada mode server, URL &amp; Anon Public Key otomatis tersinkron ke semua browser. Jika aplikasi dijalankan lewat GitHub + Netlify (hosting statis), isi <code className="font-mono text-slate-700">VITE_SUPABASE_URL</code> dan{' '}
+              <code className="font-mono text-slate-700">VITE_SUPABASE_ANON_KEY</code> di panel Environment Variables Netlify (atau <code className="font-mono text-slate-700">.env</code> / Secrets) lalu redeploy agar otomatis aktif di semua browser.
             </p>
 
             <form onSubmit={handleTestAndSaveSupabase} className="space-y-3 text-xs">

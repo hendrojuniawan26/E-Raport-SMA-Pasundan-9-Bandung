@@ -75,10 +75,17 @@ export function getSupabaseConfig(): ResolvedSupabaseConfig {
   return { url: '', anonKey: '', source: 'none' };
 }
 
-export async function loadServerSupabaseConfig(): Promise<ResolvedSupabaseConfig> {
+export async function loadServerSupabaseConfig(
+  skipServerFetch = false
+): Promise<ResolvedSupabaseConfig> {
+  const current = getSupabaseConfig();
+  if (current.source === 'env' || skipServerFetch) {
+    return current;
+  }
   try {
     const res = await fetch('/api/config/supabase');
-    if (res.ok) {
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (res.ok && contentType.includes('application/json')) {
       const data = (await res.json()) as {
         configured?: boolean;
         source?: 'env' | 'server' | 'none';
@@ -107,7 +114,7 @@ export async function saveServerSupabaseConfigRemote(
   url: string,
   anonKey: string,
   authToken: string | null
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; staticHost?: boolean; error?: string }> {
   try {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -122,6 +129,10 @@ export async function saveServerSupabaseConfigRemote(
       headers,
       body: JSON.stringify({ url: url.trim(), anonKey: anonKey.trim() }),
     });
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (res.status === 404 || !contentType.includes('application/json')) {
+      return { ok: false, staticHost: true };
+    }
     const data = (await res.json()) as { ok?: boolean; error?: string };
     if (!res.ok) {
       return { ok: false, error: data.error || 'Gagal menyimpan konfigurasi Supabase ke server.' };
@@ -133,7 +144,7 @@ export async function saveServerSupabaseConfigRemote(
     };
     return { ok: true };
   } catch {
-    return { ok: false, error: 'Server tidak merespons saat menyimpan konfigurasi.' };
+    return { ok: false, staticHost: true };
   }
 }
 
@@ -156,7 +167,8 @@ export async function clearServerSupabaseConfigRemote(
       credentials: 'same-origin',
       headers,
     });
-    if (res.status === 401) {
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (res.status === 401 || res.status === 404 || !contentType.includes('application/json')) {
       return { ok: true };
     }
     if (!res.ok) {
@@ -165,7 +177,7 @@ export async function clearServerSupabaseConfigRemote(
     }
     return { ok: true };
   } catch {
-    return { ok: false, error: 'Gagal menghubungi server.' };
+    return { ok: true };
   }
 }
 
