@@ -33,9 +33,30 @@ export function generateUuid(): string {
   });
 }
 
+function deriveDeterministicUuid(seedUuid: string, tag: string): string {
+  const clean = seedUuid.replace(/[^0-9a-f]/gi, '').toLowerCase().padEnd(32, '0');
+  let h1 = 0x9e3779b1;
+  let h2 = 0x85ebca77;
+  const input = `${clean}:${tag}`;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 0x85ebca6b) >>> 0;
+    h2 = Math.imul(h2 ^ ch, 0xc2b2ae35) >>> 0;
+  }
+  const suffix =
+    h1.toString(16).padStart(8, '0').slice(-4) +
+    h2.toString(16).padStart(8, '0');
+  const head = clean.slice(0, 12);
+  const clockHi = ((parseInt(clean.slice(16, 18), 16) & 0x3f) | 0x80)
+    .toString(16)
+    .padStart(2, '0');
+  const clockLo = clean.slice(18, 20);
+  return `${head.slice(0, 8)}-${head.slice(8, 12)}-4${clean.slice(13, 16)}-${clockHi}${clockLo}-${suffix}`;
+}
+
 export interface SupabaseLoadedSchoolData {
   settings?: SchoolSettings;
-  users?: UserProfile[];
+  users?: (UserProfile & { hasPassword?: boolean })[];
   classes: ClassRoom[];
   subjects: Subject[];
   students: Student[];
@@ -59,7 +80,11 @@ export async function fetchSchoolStateFromSupabase(
       homeroomRes,
       submissionsRes,
     ] = await Promise.all([
-      client.from('school_settings').select('*').limit(1),
+      client
+        .from('school_settings')
+        .select('*')
+        .order('updated_at', { ascending: false })
+        .limit(1),
       client.from('profiles').select('*').order('full_name', { ascending: true }),
       client
         .from('classes')
@@ -80,6 +105,7 @@ export async function fetchSchoolStateFromSupabase(
 
     const firstError =
       settingsRes.error ||
+      profilesRes.error ||
       classesRes.error ||
       subjectsRes.error ||
       loRes.error ||
@@ -94,23 +120,49 @@ export async function fetchSchoolStateFromSupabase(
         return {
           ok: false,
           error:
-            'Akses baca tabel Supabase ditolak (42501 permission denied). Pastikan Anda masuk dengan akun yang terdaftar di Supabase Authentication (dengan role yang sesuai di tabel profiles) dan skrip SQL RLS/GRANT terbaru sudah dijalankan di Supabase SQL Editor.',
+            'Akses baca tabel Supabase ditolak (42501 permission denied). Pastikan Anda masuk dengan akun aktif yang terdaftar di Supabase Authentication (dengan role yang sesuai di tabel profiles) dan skrip SQL RLS/GRANT terbaru sudah dijalankan di Supabase SQL Editor.',
         };
       }
       return { ok: false, error: firstError.message };
     }
 
-    const profiles: UserProfile[] = Array.isArray(profilesRes.data)
-      ? profilesRes.data.map((row) => ({
+    const classes: ClassRoom[] = Array.isArray(classesRes.data)
+      ? classesRes.data.map((row) => ({
           id: String(row.id),
-          email: String(row.email || ''),
-          fullName: String(row.full_name || ''),
-          nipNuptk: String(row.nip_nuptk || ''),
-          nrks: row.nrks ? String(row.nrks) : undefined,
-          role: (row.role as UserRole) || 'guru',
-          avatarUrl: row.avatar_url ? String(row.avatar_url) : undefined,
-          isActive: true,
+          name: String(row.name),
+          gradeLevel: (row.grade_level === 10 || row.grade_level === 12
+            ? row.grade_level
+            : 11) as 10 | 11 | 12,
+          fase: row.fase === 'E' ? 'E' : 'F',
+          homeroomTeacherId: row.homeroom_teacher_id
+            ? String(row.homeroom_teacher_id)
+            : undefined,
+          academicYear: String(row.academic_year || '2025/2026'),
         }))
+      : [];
+
+    const profiles: (UserProfile & { hasPassword?: boolean })[] = Array.isArray(profilesRes.data)
+      ? profilesRes.data.map((row) => {
+          const id = String(row.id);
+          const role = (row.role as UserRole) || 'guru';
+          const explicitClassId = row.assigned_class_id ? String(row.assigned_class_id) : undefined;
+          const inferredClassId =
+            role === 'wali_kelas'
+              ? explicitClassId || classes.find((c) => c.homeroomTeacherId === id)?.id
+              : undefined;
+          return {
+            id,
+            email: String(row.email || ''),
+            fullName: String(row.full_name || ''),
+            nipNuptk: String(row.nip_nuptk || ''),
+            nrks: row.nrks ? String(row.nrks) : undefined,
+            role,
+            avatarUrl: row.avatar_url ? String(row.avatar_url) : undefined,
+            assignedClassId: inferredClassId,
+            isActive: row.is_active !== false,
+            hasPassword: true,
+          };
+        })
       : [];
 
     const profileMap = new Map(profiles.map((p) => [p.id, p]));
@@ -144,21 +196,6 @@ export async function fetchSchoolStateFromSupabase(
         },
       };
     }
-
-    const classes: ClassRoom[] = Array.isArray(classesRes.data)
-      ? classesRes.data.map((row) => ({
-          id: String(row.id),
-          name: String(row.name),
-          gradeLevel: (row.grade_level === 10 || row.grade_level === 12
-            ? row.grade_level
-            : 11) as 10 | 11 | 12,
-          fase: row.fase === 'E' ? 'E' : 'F',
-          homeroomTeacherId: row.homeroom_teacher_id
-            ? String(row.homeroom_teacher_id)
-            : undefined,
-          academicYear: String(row.academic_year || '2025/2026'),
-        }))
-      : [];
 
     const loBySubject = new Map<string, { tpList: TujuanPembelajaran[]; sasTitle: string }>();
     if (Array.isArray(loRes.data)) {
@@ -278,21 +315,31 @@ export async function fetchSchoolStateFromSupabase(
       : [];
 
     const gradeSubmissions: GradeSubmission[] = Array.isArray(submissionsRes.data)
-      ? submissionsRes.data.map((row) => ({
-          id: String(row.id),
-          classId: String(row.class_id),
-          subjectId: String(row.subject_id),
-          academicYear: String(row.academic_year || '2025/2026'),
-          semester: row.semester === 'Genap' ? 'Genap' : 'Ganjil',
-          status:
-            row.status === 'locked' || row.status === 'sent' ? row.status : 'draft',
-          lockedAt: row.locked_at ? String(row.locked_at) : undefined,
-          lockedBy: row.locked_by ? String(row.locked_by) : undefined,
-          sentAt: row.sent_at ? String(row.sent_at) : undefined,
-          sentBy: row.sent_by ? String(row.sent_by) : undefined,
-          note: row.note ? String(row.note) : undefined,
-          updatedAt: row.updated_at ? String(row.updated_at) : new Date().toISOString(),
-        }))
+      ? submissionsRes.data.map((row) => {
+          const lockedById = row.locked_by ? String(row.locked_by) : '';
+          const sentById = row.sent_by ? String(row.sent_by) : '';
+          const lockedName = row.locked_by_name ? String(row.locked_by_name).trim() : '';
+          const sentName = row.sent_by_name ? String(row.sent_by_name).trim() : '';
+          return {
+            id: String(row.id),
+            classId: String(row.class_id),
+            subjectId: String(row.subject_id),
+            academicYear: String(row.academic_year || '2025/2026'),
+            semester: row.semester === 'Genap' ? 'Genap' : 'Ganjil',
+            status:
+              row.status === 'locked' || row.status === 'sent' ? row.status : 'draft',
+            lockedAt: row.locked_at ? String(row.locked_at) : undefined,
+            lockedBy:
+              lockedName ||
+              (lockedById ? profileMap.get(lockedById)?.fullName || lockedById : undefined),
+            sentAt: row.sent_at ? String(row.sent_at) : undefined,
+            sentBy:
+              sentName ||
+              (sentById ? profileMap.get(sentById)?.fullName || sentById : undefined),
+            note: row.note ? String(row.note) : undefined,
+            updatedAt: row.updated_at ? String(row.updated_at) : new Date().toISOString(),
+          };
+        })
       : [];
 
     return {
@@ -319,7 +366,7 @@ export async function fetchSchoolStateFromSupabase(
 function formatSupabaseSyncError(table: string, err: { code?: string; message: string }): string {
   const lower = err.message.toLowerCase();
   if (err.code === '42501' || lower.includes('permission denied') || lower.includes('row-level security')) {
-    return `Izin simpan ke tabel "${table}" ditolak RLS/GRANT (${err.message}). Pastikan akun Anda login melalui Supabase Auth dan memiliki role yang sesuai di tabel profiles.`;
+    return `Izin simpan ke tabel "${table}" ditolak RLS/GRANT (${err.message}). Pastikan akun Anda login melalui Supabase Auth dan memiliki role aktif yang sesuai di tabel profiles.`;
   }
   if (err.code === '42P01' || lower.includes('does not exist')) {
     return `Tabel "${table}" belum tersedia di Supabase. Jalankan skrip SQL di tab Database Supabase & SQL.`;
@@ -331,6 +378,7 @@ export async function syncSchoolDataToSupabase(
   client: SupabaseClient,
   payload: {
     role: UserRole;
+    userId?: string;
     settings: SchoolSettings;
     classes: ClassRoom[];
     subjects: Subject[];
@@ -352,6 +400,8 @@ export async function syncSchoolDataToSupabase(
     };
   }
 
+  const activeUid = sessionData.session.user.id || payload.userId || '';
+
   // Fetch valid Supabase profile IDs to avoid FK violation on teacher_id/homeroom_teacher_id
   let validProfileIds = new Set<string>();
   try {
@@ -362,6 +412,8 @@ export async function syncSchoolDataToSupabase(
   } catch {
     // ignore
   }
+
+  const validActorProfileId = isUuid(activeUid) && validProfileIds.has(activeUid) ? activeUid : null;
 
   if (role === 'admin') {
     const settingsRow = {
@@ -460,41 +512,139 @@ export async function syncSchoolDataToSupabase(
     }
   }
 
-  // Staff (admin, guru, wali_kelas) can sync Learning Objectives
-  const loRows: {
-    id: string;
-    subject_id: string;
-    code: string;
-    title: string;
-    is_sas: boolean;
-    sort_order: number;
-  }[] = [];
-  subjects.forEach((sub) => {
-    if (!isUuid(sub.id)) return;
-    sub.tpList.forEach((tp, idx) => {
-      if (!isUuid(tp.id)) return;
+  // Ownership scope for non-admin users so RLS checks never reject valid partial syncs
+  const accessibleSubjectIds = new Set<string>(
+    subjects
+      .filter((s) => {
+        if (!isUuid(s.id)) return false;
+        if (role === 'admin') return true;
+        if (role === 'guru') return !s.teacherId || s.teacherId === activeUid;
+        return true;
+      })
+      .map((s) => s.id)
+  );
+
+  const accessibleClassIds = new Set<string>(
+    classes
+      .filter((c) => {
+        if (!isUuid(c.id)) return false;
+        if (role === 'admin') return true;
+        if (role === 'wali_kelas') {
+          return !c.homeroomTeacherId || c.homeroomTeacherId === activeUid;
+        }
+        return true;
+      })
+      .map((c) => c.id)
+  );
+
+  const studentClassMap = new Map<string, string>();
+  students.forEach((st) => {
+    studentClassMap.set(st.id, st.classId);
+  });
+
+  // Sync Learning Objectives (TPs + SAS title) and prune deleted TPs for synced subjects
+  const subjectsForLo = subjects.filter(
+    (sub) => isUuid(sub.id) && (role === 'admin' || role === 'wali_kelas' || accessibleSubjectIds.has(sub.id))
+  );
+
+  if (subjectsForLo.length > 0) {
+    const loSubjectIds = subjectsForLo.map((s) => s.id);
+    const existingSasIdBySubject = new Map<string, string>();
+    const existingNonSasIdsBySubject = new Map<string, string[]>();
+
+    try {
+      const { data: existingLos } = await client
+        .from('learning_objectives')
+        .select('id, subject_id, is_sas')
+        .in('subject_id', loSubjectIds);
+
+      if (Array.isArray(existingLos)) {
+        existingLos.forEach((row) => {
+          const subId = String(row.subject_id);
+          const id = String(row.id);
+          if (row.is_sas) {
+            if (!existingSasIdBySubject.has(subId)) {
+              existingSasIdBySubject.set(subId, id);
+            }
+          } else {
+            const list = existingNonSasIdsBySubject.get(subId) || [];
+            list.push(id);
+            existingNonSasIdsBySubject.set(subId, list);
+          }
+        });
+      }
+    } catch {
+      // ignore read failure and proceed with upsert
+    }
+
+    const loRows: {
+      id: string;
+      subject_id: string;
+      code: string;
+      title: string;
+      is_sas: boolean;
+      sort_order: number;
+    }[] = [];
+    const staleLoIds: string[] = [];
+
+    subjectsForLo.forEach((sub) => {
+      const currentTpIds = new Set<string>();
+      sub.tpList.forEach((tp, idx) => {
+        if (!isUuid(tp.id)) return;
+        currentTpIds.add(tp.id);
+        loRows.push({
+          id: tp.id,
+          subject_id: sub.id,
+          code: tp.code,
+          title: tp.title,
+          is_sas: false,
+          sort_order: idx + 1,
+        });
+      });
+
+      const prevIds = existingNonSasIdsBySubject.get(sub.id) || [];
+      prevIds.forEach((id) => {
+        if (!currentTpIds.has(id)) {
+          staleLoIds.push(id);
+        }
+      });
+
+      // Persist SAS title as is_sas = true row
+      const sasId = existingSasIdBySubject.get(sub.id) || deriveDeterministicUuid(sub.id, 'sas');
       loRows.push({
-        id: tp.id,
+        id: sasId,
         subject_id: sub.id,
-        code: tp.code,
-        title: tp.title,
-        is_sas: false,
-        sort_order: idx + 1,
+        code: 'SAS',
+        title: sub.sasTitle || 'Sumatif Akhir Semester',
+        is_sas: true,
+        sort_order: 999,
       });
     });
-  });
-  if (loRows.length > 0) {
-    const { error } = await client
-      .from('learning_objectives')
-      .upsert(loRows, { onConflict: 'id' });
-    if (error) return { ok: false, error: formatSupabaseSyncError('learning_objectives', error) };
+
+    if (staleLoIds.length > 0) {
+      await client.from('learning_objectives').delete().in('id', staleLoIds);
+    }
+
+    if (loRows.length > 0) {
+      const { error } = await client
+        .from('learning_objectives')
+        .upsert(loRows, { onConflict: 'id' });
+      if (error) return { ok: false, error: formatSupabaseSyncError('learning_objectives', error) };
+    }
   }
 
-  // Staff sync grades
+  // Staff sync grades (scoped to accessible rows; omit `id` on composite conflict)
   const validGradeRows = grades
-    .filter((g) => isUuid(g.studentId) && isUuid(g.subjectId))
+    .filter((g) => {
+      if (!isUuid(g.studentId) || !isUuid(g.subjectId)) return false;
+      if (role === 'guru') return accessibleSubjectIds.has(g.subjectId);
+      if (role === 'wali_kelas') {
+        const stuClassId = studentClassMap.get(g.studentId) || '';
+        return accessibleClassIds.has(stuClassId);
+      }
+      return true;
+    })
     .map((g) => ({
-      ...(isUuid(g.id) ? { id: g.id } : {}),
       student_id: g.studentId,
       subject_id: g.subjectId,
       academic_year: g.academicYear,
@@ -510,6 +660,7 @@ export async function syncSchoolDataToSupabase(
       predikat: g.predikat,
       deskripsi_auto: g.deskripsiAuto,
       deskripsi_manual: g.deskripsiManual || null,
+      ...(validActorProfileId ? { updated_by: validActorProfileId } : {}),
     }));
   if (validGradeRows.length > 0) {
     const { error } = await client
@@ -520,9 +671,15 @@ export async function syncSchoolDataToSupabase(
 
   if (role === 'admin' || role === 'wali_kelas') {
     const validHrRows = homeroomRecords
-      .filter((hr) => isUuid(hr.studentId))
+      .filter((hr) => {
+        if (!isUuid(hr.studentId)) return false;
+        if (role === 'wali_kelas') {
+          const stuClassId = studentClassMap.get(hr.studentId) || '';
+          return accessibleClassIds.has(stuClassId);
+        }
+        return true;
+      })
       .map((hr) => ({
-        ...(isUuid(hr.id) ? { id: hr.id } : {}),
         student_id: hr.studentId,
         academic_year: hr.academicYear,
         semester: hr.semester,
@@ -533,6 +690,7 @@ export async function syncSchoolDataToSupabase(
         promotion_status: hr.promotionStatus,
         extracurriculars: hr.extracurriculars,
         p5_projects: hr.p5Projects,
+        ...(validActorProfileId ? { updated_by: validActorProfileId } : {}),
       }));
     if (validHrRows.length > 0) {
       const { error } = await client
@@ -543,16 +701,34 @@ export async function syncSchoolDataToSupabase(
   }
 
   const validSubRows = gradeSubmissions
-    .filter((sub) => isUuid(sub.classId) && isUuid(sub.subjectId))
+    .filter((sub) => {
+      if (!isUuid(sub.classId) || !isUuid(sub.subjectId)) return false;
+      if (role === 'guru') return accessibleSubjectIds.has(sub.subjectId);
+      if (role === 'wali_kelas') return accessibleClassIds.has(sub.classId);
+      return true;
+    })
     .map((sub) => ({
-      ...(isUuid(sub.id) ? { id: sub.id } : {}),
       class_id: sub.classId,
       subject_id: sub.subjectId,
       academic_year: sub.academicYear,
       semester: sub.semester,
       status: sub.status,
       locked_at: sub.lockedAt || null,
+      locked_by:
+        sub.lockedBy && validProfileIds.has(sub.lockedBy)
+          ? sub.lockedBy
+          : sub.status !== 'draft' && validActorProfileId
+            ? validActorProfileId
+            : null,
+      locked_by_name: sub.lockedBy || '',
       sent_at: sub.sentAt || null,
+      sent_by:
+        sub.sentBy && validProfileIds.has(sub.sentBy)
+          ? sub.sentBy
+          : sub.status === 'sent' && validActorProfileId
+            ? validActorProfileId
+            : null,
+      sent_by_name: sub.sentBy || '',
       note: sub.note || null,
     }));
   if (validSubRows.length > 0) {

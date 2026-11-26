@@ -46,15 +46,19 @@ const STORAGE_KEY = 'pasundan9_eraport_state_v4';
 const LEGACY_STORAGE_KEY = 'pasundan9_eraport_state_v3';
 const NOTIF_STORAGE_KEY = 'pasundan9_eraport_notifications_v1';
 const READ_NOTIF_IDS_KEY = 'pasundan9_eraport_read_notif_ids_v1';
-const AUTH_TOKEN_KEY = 'pasundan9_auth_token_v1';
 
-function loadStoredAuthToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    return window.sessionStorage.getItem(AUTH_TOKEN_KEY);
-  } catch {
-    return null;
+function buildExpressHeaders(
+  token: string | null,
+  extra?: Record<string, string>
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'X-Requested-With': 'XMLHttpRequest',
+    ...(extra || {}),
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
   }
+  return headers;
 }
 
 function loadStoredNotifications(): GradeNotification[] {
@@ -191,6 +195,8 @@ interface AppContextValue {
   supabaseMessage: string;
   supabaseConfigSource: SupabaseConfigSource;
   supabaseSessionActive: boolean;
+  supabaseEmailDisabled: boolean;
+  recheckSupabaseHealth: () => Promise<void>;
   settings: SchoolSettings;
   users: AuthUserSummary[];
   classes: ClassRoom[];
@@ -280,21 +286,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const initial = useMemo(() => loadInitialState(), []);
 
   const [currentUser, setCurrentUser] = useState<AuthUserSummary | null>(null);
-  const [authToken, setAuthTokenState] = useState<string | null>(loadStoredAuthToken);
-  const setAuthToken = (token: string | null) => {
-    setAuthTokenState(token);
-    if (typeof window !== 'undefined') {
-      try {
-        if (token) {
-          window.sessionStorage.setItem(AUTH_TOKEN_KEY, token);
-        } else {
-          window.sessionStorage.removeItem(AUTH_TOKEN_KEY);
-        }
-      } catch {
-        // ignore storage quota
-      }
-    }
-  };
+  const [authToken, setAuthToken] = useState<string | null>(null);
   const [authStatus, setAuthStatus] = useState<AuthSystemStatus>({
     adminClaimed: false,
     envPasscodeConfigured: false,
@@ -365,6 +357,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     () => getSupabaseConfig().source
   );
   const [supabaseSessionActive, setSupabaseSessionActive] = useState<boolean>(false);
+  const [supabaseEmailDisabled, setSupabaseEmailDisabled] = useState<boolean>(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('saved_local');
   const [supabaseMessage, setSupabaseMessage] = useState<string>(
     'Mode Offline-Fallback aktif — auto-save lokal berjalan otomatis.'
@@ -492,10 +485,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const fetchAuthorizedUsers = async (token: string) => {
+  const fetchAuthorizedUsers = async (token: string | null) => {
     try {
       const res = await fetch('/api/users', {
-        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'same-origin',
+        headers: buildExpressHeaders(token),
       });
       if (res.ok) {
         const data = (await res.json()) as { users: AuthUserSummary[] };
@@ -509,12 +503,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   const loadSchoolStateFromServer = async (
-    token: string,
+    token: string | null,
     role?: UserRole
   ): Promise<{ subjects?: Subject[]; classes?: ClassRoom[] }> => {
     try {
       const res = await fetch('/api/school-state', {
-        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'same-origin',
+        headers: buildExpressHeaders(token),
       });
       if (!res.ok) return {};
       const data = (await res.json()) as {
@@ -546,10 +541,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (!data.initialized && role === 'admin') {
         await fetch('/api/school-state', {
           method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
+          credentials: 'same-origin',
+          headers: buildExpressHeaders(token, { 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             settings,
             classes,
@@ -567,7 +560,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return {};
   };
 
-  const syncFromSupabaseInternal = async (): Promise<{
+  const syncFromSupabaseInternal = async (options?: {
+    skipIfEmptyAndHasLocal?: boolean;
+  }): Promise<{
     ok: boolean;
     message: string;
     subjects?: Subject[];
@@ -586,6 +581,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
 
     const loaded = res.data;
+    const remoteEmpty =
+      loaded.classes.length === 0 &&
+      loaded.subjects.length === 0 &&
+      loaded.students.length === 0 &&
+      loaded.grades.length === 0 &&
+      loaded.homeroomRecords.length === 0;
+    const hasLocal =
+      latestDataRef.current.classes.length > 0 ||
+      latestDataRef.current.subjects.length > 0 ||
+      latestDataRef.current.students.length > 0;
+
+    if (options?.skipIfEmptyAndHasLocal && remoteEmpty && hasLocal) {
+      if (loaded.users && loaded.users.length > 0) {
+        setUsers(loaded.users);
+      }
+      return {
+        ok: true,
+        message: `Terhubung ke Supabase. Data lokal (${latestDataRef.current.classes.length} kelas, ${latestDataRef.current.students.length} siswa) dipertahankan; klik "Kirim Data Lokal ke Supabase" untuk mengunggah.`,
+        subjects: latestDataRef.current.subjects,
+        classes: latestDataRef.current.classes,
+      };
+    }
+
     skipNextRemoteSyncRef.current = true;
     if (loaded.settings) setSettings(loaded.settings);
     if (loaded.users && loaded.users.length > 0) setUsers(loaded.users);
@@ -628,6 +646,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setSyncStatus('syncing');
     const res = await syncSchoolDataToSupabase(client, {
       role: currentUser.role,
+      userId: currentUser.id,
       settings,
       classes,
       subjects,
@@ -671,20 +690,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     refreshAuthStatus();
 
     const restoreExpressSession = async () => {
-      const storedToken = loadStoredAuthToken();
-      if (!storedToken) return false;
       try {
-        const res = await fetch('/api/auth/me', {
-          headers: { Authorization: `Bearer ${storedToken}` },
+        const res = await fetch('/api/auth/session', {
+          credentials: 'same-origin',
+          headers: buildExpressHeaders(null),
         });
         if (!res.ok) {
-          setAuthToken(null);
           return false;
         }
-        const data = (await res.json()) as { user?: AuthUserSummary };
-        if (data.user) {
-          await loadSchoolStateFromServer(storedToken, data.user.role);
-          await fetchAuthorizedUsers(storedToken);
+        const data = (await res.json()) as {
+          authenticated?: boolean;
+          user?: AuthUserSummary | null;
+        };
+        if (data.authenticated && data.user) {
+          await loadSchoolStateFromServer(null, data.user.role);
+          await fetchAuthorizedUsers(null);
           setCurrentUser((prev) => prev || data.user!);
           return true;
         }
@@ -702,9 +722,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (cfg.url && cfg.anonKey) {
         const res = await testSupabaseConnection();
         setSupabaseSessionActive(Boolean(res.hasSession));
+        setSupabaseEmailDisabled(Boolean(res.emailProviderDisabled));
         if (res.ok) {
           setConnectionMode('supabase');
-          setSyncStatus(res.tablesReady && res.hasSession ? 'connected' : res.hasSession ? 'error' : 'connected');
+          setSyncStatus(
+            res.emailProviderDisabled
+              ? 'error'
+              : !res.hasSession || res.tablesReady
+                ? 'connected'
+                : 'error'
+          );
           setSupabaseMessage(res.message);
         } else {
           setConnectionMode(cfg.url && cfg.anonKey ? 'supabase' : 'offline');
@@ -724,13 +751,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               .eq('id', authUser.id)
               .maybeSingle();
 
-            const sbSync = await syncFromSupabaseInternal();
+            if (profile && profile.is_active === false) {
+              await client.auth.signOut().catch(() => {});
+              setSupabaseSessionActive(false);
+              setSyncStatus('error');
+              setSupabaseMessage('Akun ini sedang dinonaktifkan oleh Admin Sekolah.');
+              return;
+            }
+
+            const sbSync = await syncFromSupabaseInternal({ skipIfEmptyAndHasLocal: true });
             if (!sbSync.ok) {
               setSyncStatus('error');
               setSupabaseMessage(sbSync.message);
             }
 
             if (profile) {
+              const meta = (authUser.user_metadata || {}) as Record<string, unknown>;
+              const mappedAssignedClassId =
+                (typeof profile.assigned_class_id === 'string' && profile.assigned_class_id) ||
+                (typeof meta.assigned_class_id === 'string' && meta.assigned_class_id) ||
+                (profile.role === 'wali_kelas'
+                  ? sbSync.classes?.find((c) => c.homeroomTeacherId === profile.id)?.id
+                  : undefined);
               const mapped: AuthUserSummary = {
                 id: profile.id,
                 email: profile.email,
@@ -739,13 +781,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 nrks: profile.nrks || '',
                 role: profile.role,
                 avatarUrl: profile.avatar_url || undefined,
-                isActive: true,
+                assignedClassId: mappedAssignedClassId || undefined,
+                isActive: profile.is_active !== false,
               };
               setCurrentUser(mapped);
               applyAuthenticatedFocus(mapped, sbSync.subjects, sbSync.classes);
             }
-          } else if (res.ok && res.tablesReady) {
-            await syncFromSupabaseInternal().catch(() => {});
           }
         }
       }
@@ -951,7 +992,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
         );
 
-        if (authToken && currentUser && !shouldSkipRemoteSync) {
+        if (currentUser && !shouldSkipRemoteSync) {
           const remoteBody: Partial<PersistedState> = {
             grades,
             gradeSubmissions,
@@ -967,10 +1008,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           await fetch('/api/school-state', {
             method: 'PUT',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${authToken}`,
-            },
+            credentials: 'same-origin',
+            headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
             body: JSON.stringify(remoteBody),
           }).catch(() => {});
         }
@@ -979,6 +1018,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (client && connectionMode === 'supabase' && currentUser && !shouldSkipRemoteSync) {
           const sbPush = await syncSchoolDataToSupabase(client, {
             role: currentUser.role,
+            userId: currentUser.id,
             settings,
             classes,
             subjects,
@@ -1038,7 +1078,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
     setGrades((prev) => {
       const idx = prev.findIndex(
-        (g) => g.studentId === normalizedGrade.studentId && g.subjectId === normalizedGrade.subjectId
+        (g) =>
+          g.studentId === normalizedGrade.studentId &&
+          g.subjectId === normalizedGrade.subjectId &&
+          g.academicYear === normalizedGrade.academicYear &&
+          g.semester === normalizedGrade.semester
       );
       if (idx >= 0) {
         const copy = [...prev];
@@ -1059,7 +1103,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         .from('student_grades')
         .upsert(
           {
-            id: normalizedGrade.id,
             student_id: normalizedGrade.studentId,
             subject_id: normalizedGrade.subjectId,
             academic_year: normalizedGrade.academicYear,
@@ -1075,6 +1118,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             predikat: normalizedGrade.predikat,
             deskripsi_auto: normalizedGrade.deskripsiAuto,
             deskripsi_manual: normalizedGrade.deskripsiManual || null,
+            ...(isUuid(latestDataRef.current.currentUser?.id)
+              ? { updated_by: latestDataRef.current.currentUser?.id }
+              : {}),
+            updated_at: normalizedGrade.updatedAt || new Date().toISOString(),
           },
           { onConflict: 'student_id,subject_id,academic_year,semester' }
         )
@@ -1128,15 +1175,55 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   const bulkUpsertGrades = (incoming: SubjectGrade[]) => {
+    const normalizedIncoming = incoming.map((g) => ({
+      ...g,
+      id: isUuid(g.id) ? g.id : generateUuid(),
+    }));
     setGrades((prev) => {
       const map = new Map<string, SubjectGrade>();
-      prev.forEach((g) => map.set(`${g.studentId}__${g.subjectId}`, g));
-      incoming.forEach((g) => map.set(`${g.studentId}__${g.subjectId}`, g));
+      prev.forEach((g) =>
+        map.set(`${g.studentId}__${g.subjectId}__${g.academicYear}__${g.semester}`, g)
+      );
+      normalizedIncoming.forEach((g) =>
+        map.set(`${g.studentId}__${g.subjectId}__${g.academicYear}__${g.semester}`, g)
+      );
       return Array.from(map.values());
     });
 
     const client = getSupabaseClient();
-    if (client && incoming.length > 0) {
+    if (client && normalizedIncoming.length > 0) {
+      if (connectionMode === 'supabase') {
+        const validRows = normalizedIncoming
+          .filter((g) => isUuid(g.studentId) && isUuid(g.subjectId))
+          .map((g) => ({
+            student_id: g.studentId,
+            subject_id: g.subjectId,
+            academic_year: g.academicYear,
+            semester: g.semester,
+            tp_scores: g.tpScores,
+            sas_ppk: g.sasPpk,
+            sas_prk: g.sasPrk,
+            kehadiran: g.kehadiran,
+            proses: g.proses,
+            tugas: g.tugas,
+            p3_scores: g.p3Scores,
+            nilai_akhir: g.nilaiAkhir,
+            predikat: g.predikat,
+            deskripsi_auto: g.deskripsiAuto,
+            deskripsi_manual: g.deskripsiManual || null,
+            ...(isUuid(latestDataRef.current.currentUser?.id)
+              ? { updated_by: latestDataRef.current.currentUser?.id }
+              : {}),
+            updated_at: g.updatedAt || new Date().toISOString(),
+          }));
+        if (validRows.length > 0) {
+          client
+            .from('student_grades')
+            .upsert(validRows, { onConflict: 'student_id,subject_id,academic_year,semester' })
+            .then(() => {});
+        }
+      }
+
       const {
         students: stuList,
         subjects: subList,
@@ -1145,7 +1232,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       } = latestDataRef.current;
       const groups = new Map<string, { classId: string; subjectId: string; count: number }>();
 
-      incoming.forEach((g) => {
+      normalizedIncoming.forEach((g) => {
         if (g.nilaiAkhir <= 0) return;
         const stu = stuList.find((s) => s.id === g.studentId);
         if (!stu) return;
@@ -1189,7 +1276,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       id: isUuid(record.id) ? record.id : generateUuid(),
     };
     setHomeroomRecords((prev) => {
-      const idx = prev.findIndex((r) => r.studentId === normalized.studentId);
+      const idx = prev.findIndex(
+        (r) =>
+          r.studentId === normalized.studentId &&
+          r.academicYear === normalized.academicYear &&
+          r.semester === normalized.semester
+      );
       if (idx >= 0) {
         const copy = [...prev];
         copy[idx] = normalized;
@@ -1374,16 +1466,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
           if (!serverVerifiedAuth && !activeProfile) {
             await client.auth.signOut().catch(() => {});
-            if (profileQueryError && expectedRole === 'admin') {
+            if (profileQueryError) {
               return {
                 ok: false,
-                error: `Tabel profiles di Supabase belum siap (${profileQueryError}). Jalankan skrip SQL di Supabase SQL Editor lalu pastikan role akun di tabel profiles adalah 'admin'.`,
+                error: `Login Supabase berhasil, namun gagal membaca tabel profiles (${profileQueryError}). Pastikan skrip SQL terbaru sudah dijalankan di Supabase SQL Editor dan akun memiliki role aktif di tabel public.profiles.`,
               };
             }
             return {
               ok: false,
               error:
-                'Akun ini belum didaftarkan oleh Admin Sekolah. Hanya Admin yang dapat mendaftarkan akun baru.',
+                'Akun ini belum memiliki profil role di tabel public.profiles. Pastikan akun dibuat oleh Admin Sekolah atau jalankan ulang skrip SQL terbaru.',
+            };
+          }
+
+          if (activeProfile && activeProfile.is_active === false) {
+            await client.auth.signOut().catch(() => {});
+            return {
+              ok: false,
+              error: 'Akun ini sedang dinonaktifkan oleh Admin Sekolah.',
             };
           }
 
@@ -1404,10 +1504,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             };
           }
 
+          const resolvedAssignedClassId =
+            (typeof activeProfile?.assigned_class_id === 'string' &&
+              activeProfile.assigned_class_id) ||
+            serverVerifiedAuth?.user.assignedClassId ||
+            (typeof meta.assigned_class_id === 'string' && meta.assigned_class_id) ||
+            undefined;
+
           const mapped: AuthUserSummary = serverVerifiedAuth
             ? {
                 ...serverVerifiedAuth.user,
                 id: activeProfile?.id ? String(activeProfile.id) : serverVerifiedAuth.user.id,
+                assignedClassId: resolvedAssignedClassId,
+                isActive: activeProfile ? activeProfile.is_active !== false : true,
               }
             : {
                 id: data.user.id,
@@ -1428,11 +1537,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   typeof activeProfile?.avatar_url === 'string'
                     ? activeProfile.avatar_url
                     : undefined,
-                assignedClassId:
-                  typeof meta.assigned_class_id === 'string'
-                    ? meta.assigned_class_id
-                    : undefined,
-                isActive: true,
+                assignedClassId: resolvedAssignedClassId,
+                isActive: activeProfile ? activeProfile.is_active !== false : true,
               };
 
           if (serverVerifiedAuth) {
@@ -1443,8 +1549,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
           setCurrentUser(mapped);
           setSupabaseSessionActive(true);
+          setSupabaseEmailDisabled(false);
           setConnectionMode('supabase');
-          const sbSync = await syncFromSupabaseInternal();
+          const sbSync = await syncFromSupabaseInternal({ skipIfEmptyAndHasLocal: true });
           if (sbSync.ok) {
             if (mapped.role === 'admin' && activeProfile?.role !== 'admin') {
               setSyncStatus('error');
@@ -1479,7 +1586,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
         body: JSON.stringify({ email, password, expectedRole }),
       });
       const parsed = await safeParseAuthResponse<{
@@ -1487,32 +1597,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         user?: AuthUserSummary;
         error?: string;
       }>(res);
+      const formatSupabaseLoginFailure = (rawMsg: string): string => {
+        const lower = rawMsg.toLowerCase();
+        if (lower.includes('email logins are disabled') || lower.includes('email_provider_disabled')) {
+          setSupabaseEmailDisabled(true);
+          return 'Login Email di Supabase Auth sedang dinonaktifkan ("Email logins are disabled"). Buka Supabase Dashboard → Authentication → Providers → Email, aktifkan "Enable Email provider", lalu klik Save.';
+        }
+        if (lower.includes('email not confirmed')) {
+          return 'Email belum terkonfirmasi di Supabase Auth. Jalankan skrip SQL terbaru di Supabase SQL Editor agar semua akun langsung terkonfirmasi tanpa verifikasi email.';
+        }
+        if (lower.includes('invalid login credentials') || !rawMsg) {
+          return 'Email atau kata sandi salah, atau akun belum didaftarkan oleh Admin Sekolah.';
+        }
+        return `Gagal login melalui Supabase Auth: ${rawMsg}`;
+      };
+
       if (parsed.rawError) {
         if (client) {
-          const lower = supabaseErrorMessage.toLowerCase();
-          if (lower.includes('email not confirmed')) {
-            return {
-              ok: false,
-              error:
-                'Email belum terkonfirmasi di Supabase Auth. Jalankan skrip SQL terbaru di tab Database Supabase & SQL atau nonaktifkan "Confirm email" di Supabase Authentication agar akun langsung aktif tanpa verifikasi email.',
-            };
-          }
-          if (lower.includes('invalid login credentials') || !supabaseErrorMessage) {
-            return {
-              ok: false,
-              error:
-                'Email atau kata sandi salah, atau akun belum didaftarkan oleh Admin Sekolah.',
-            };
-          }
-          return {
-            ok: false,
-            error: `Gagal login melalui Supabase Auth: ${supabaseErrorMessage}`,
-          };
+          return { ok: false, error: formatSupabaseLoginFailure(supabaseErrorMessage) };
         }
         return { ok: false, error: parsed.rawError };
       }
       const data = parsed.data || {};
       if (!parsed.ok || !data.token || !data.user) {
+        if (client && supabaseErrorMessage) {
+          const lower = supabaseErrorMessage.toLowerCase();
+          if (
+            lower.includes('email logins are disabled') ||
+            lower.includes('email_provider_disabled') ||
+            lower.includes('email not confirmed') ||
+            lower.includes('banned')
+          ) {
+            return { ok: false, error: formatSupabaseLoginFailure(supabaseErrorMessage) };
+          }
+        }
         return {
           ok: false,
           error: data.error || 'Email atau kata sandi tidak sesuai.',
@@ -1523,36 +1641,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (client) {
         const { data: existingSession } = await client.auth.getSession();
         hasSbSession = Boolean(existingSession.session);
-        if (!hasSbSession && supabaseErrorMessage.toLowerCase().includes('invalid login credentials')) {
-          try {
-            const { data: signUpData } = await client.auth.signUp({
-              email: email.trim().toLowerCase(),
-              password,
-              options: {
-                data: {
-                  full_name: data.user.fullName,
-                  nip_nuptk: data.user.nipNuptk || '',
-                  ...(data.user.role !== 'admin' ? { role: data.user.role } : {}),
-                },
-              },
-            });
-            hasSbSession = Boolean(signUpData.session);
-            if (!hasSbSession && signUpData.user) {
-              const { data: signInRetry } = await client.auth.signInWithPassword({
-                email: email.trim().toLowerCase(),
-                password,
-              });
-              hasSbSession = Boolean(signInRetry.session);
-            }
-          } catch {
-            // keep Express session active even if Supabase signUp fails
-          }
-        }
       }
       setSupabaseSessionActive(hasSbSession);
 
       const sbSync = hasSbSession
-        ? await syncFromSupabaseInternal()
+        ? await syncFromSupabaseInternal({ skipIfEmptyAndHasLocal: true })
         : { ok: false, message: '', subjects: undefined, classes: undefined };
 
       setAuthToken(data.token);
@@ -1560,7 +1653,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (client && !hasSbSession) {
         setSyncStatus('error');
         setSupabaseMessage(
-          'Login berhasil melalui server sekolah, namun sesi Supabase Auth belum aktif (buat/konfirmasi akun ini di Supabase Authentication → Users dan jalankan skrip SQL di tab Database Supabase & SQL agar data tersinkron ke Supabase).'
+          'Login berhasil melalui server sekolah, namun sesi Supabase Auth belum aktif (pastikan akun terdaftar di Supabase Authentication → Users dan jalankan skrip SQL terbaru di tab Database Supabase & SQL agar data tersinkron ke Supabase).'
         );
       } else if (hasSbSession && !sbSync.ok) {
         setSyncStatus('error');
@@ -1654,45 +1747,52 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     currentPassword: string,
     newPassword: string
   ): Promise<{ ok: boolean; error?: string }> => {
-    if (authToken) {
-      try {
-        const res = await fetch('/api/auth/change-password', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${authToken}`,
-          },
-          body: JSON.stringify({ currentPassword, newPassword }),
-        });
-        const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
-        if (!parsed.rawError) {
-          const data = parsed.data || {};
-          if (!parsed.ok) {
-            return { ok: false, error: data.error || 'Gagal memperbarui kata sandi.' };
-          }
-          return { ok: true };
+    const client = getSupabaseClient();
+    let expressSucceeded = false;
+
+    try {
+      const res = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
+      if (!parsed.rawError && parsed.status !== 401) {
+        const data = parsed.data || {};
+        if (!parsed.ok) {
+          return { ok: false, error: data.error || 'Gagal memperbarui kata sandi.' };
         }
-      } catch {
-        // fall through to Supabase Auth password change if /api unreachable
+        expressSucceeded = true;
+      }
+    } catch {
+      // fall through to Supabase Auth password change if /api unreachable
+    }
+
+    if (client && currentUser?.email) {
+      const { data: sessionData } = await client.auth.getSession();
+      if (sessionData.session) {
+        if (!expressSucceeded) {
+          const { error: verifyErr } = await client.auth.signInWithPassword({
+            email: currentUser.email,
+            password: currentPassword,
+          });
+          if (verifyErr) {
+            return { ok: false, error: 'Kata sandi saat ini tidak sesuai.' };
+          }
+        }
+        const { error: updateErr } = await client.auth.updateUser({ password: newPassword });
+        if (updateErr && !expressSucceeded) {
+          return { ok: false, error: `Gagal memperbarui kata sandi: ${updateErr.message}` };
+        }
+        return { ok: true };
       }
     }
 
-    const client = getSupabaseClient();
-    if (!client || !currentUser?.email) {
-      return { ok: false, error: 'Sesi login tidak ditemukan.' };
+    if (expressSucceeded) {
+      return { ok: true };
     }
-    const { error: verifyErr } = await client.auth.signInWithPassword({
-      email: currentUser.email,
-      password: currentPassword,
-    });
-    if (verifyErr) {
-      return { ok: false, error: 'Kata sandi saat ini tidak sesuai.' };
-    }
-    const { error: updateErr } = await client.auth.updateUser({ password: newPassword });
-    if (updateErr) {
-      return { ok: false, error: `Gagal memperbarui kata sandi: ${updateErr.message}` };
-    }
-    return { ok: true };
+    return { ok: false, error: 'Sesi login tidak ditemukan.' };
   };
 
   const createUserAccount = async (payload: {
@@ -1734,8 +1834,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         };
       }
 
-      // 1. Prioritaskan RPC admin_create_user (bekerja langsung aktif tanpa verifikasi email
-      //    meskipun "Allow new users to sign up" dimatikan di Supabase Auth)
       try {
         const { data: rpcUserId, error: rpcErr } = await mainClient.rpc('admin_create_user', {
           p_email: cleanEmail,
@@ -1807,7 +1905,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           return {
             ok: false,
             error:
-              'Gagal mendaftarkan ke Supabase Auth karena "Allow new users to sign up" dimatikan (Email signups are disabled). Jalankan skrip SQL terbaru dari tab Database Supabase & SQL di Supabase SQL Editor agar Admin bisa mendaftarkan akun via fungsi admin_create_user tanpa membuka pendaftaran publik, atau aktifkan "Allow new users to sign up" di Supabase Dashboard → Authentication → Providers → Email.',
+              'Gagal mendaftarkan ke Supabase Auth karena "Allow new users to sign up" dimatikan (Email signups are disabled). Jalankan skrip SQL terbaru dari tab Database Supabase & SQL di Supabase SQL Editor agar Admin bisa mendaftarkan akun via fungsi admin_create_user tanpa membuka pendaftaran publik.',
           };
         }
         return { ok: false, error: `Gagal mendaftarkan ke Supabase Auth: ${signUpErr.message}` };
@@ -1825,6 +1923,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           nip_nuptk: cleanNip,
           nrks: cleanNrks,
           role: payload.role,
+          is_active: true,
+          assigned_class_id:
+            payload.role === 'wali_kelas' && isUuid(payload.assignedClassId)
+              ? payload.assignedClassId
+              : null,
         },
         { onConflict: 'id' }
       );
@@ -1863,53 +1966,59 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     };
 
-    if (authToken) {
-      try {
-        const res = await fetch('/api/users', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${authToken}`,
-          },
-          body: JSON.stringify(payload),
-        });
-        const parsed = await safeParseAuthResponse<{
-          user?: AuthUserSummary;
-          supabaseConfirmed?: boolean;
-          error?: string;
-        }>(res);
-        if (!parsed.rawError) {
-          const data = parsed.data || {};
-          if (!parsed.ok || !data.user) {
-            return { ok: false, error: data.error || 'Gagal menambah akun pengguna.' };
+    try {
+      const res = await fetch('/api/users', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify(payload),
+      });
+      const parsed = await safeParseAuthResponse<{
+        user?: AuthUserSummary;
+        supabaseConfirmed?: boolean;
+        error?: string;
+      }>(res);
+      if (!parsed.rawError && parsed.status !== 401) {
+        const data = parsed.data || {};
+        if (!parsed.ok || !data.user) {
+          return { ok: false, error: data.error || 'Gagal menambah akun pengguna.' };
+        }
+        let createdUser = data.user;
+        let warning: string | undefined;
+        if (!data.supabaseConfirmed) {
+          const sbMirror = await syncNewUserToSupabase().catch(() => null);
+          if (sbMirror?.ok && sbMirror.user) {
+            createdUser = { ...createdUser, id: sbMirror.user.id };
+          } else if (sbMirror && !sbMirror.ok && sbMirror.error) {
+            warning = `Akun aktif di Server Sekolah, namun sinkronisasi ke Supabase Auth gagal: ${sbMirror.error}`;
           }
-          const createdUser = data.user;
-          let warning: string | undefined;
-          if (!data.supabaseConfirmed) {
-            const sbMirror = await syncNewUserToSupabase().catch(() => null);
-            if (sbMirror && !sbMirror.ok && sbMirror.error) {
-              warning = `Akun aktif di Server Sekolah, namun sinkronisasi ke Supabase Auth gagal: ${sbMirror.error}`;
-            } else if (sbMirror && sbMirror.ok && sbMirror.autoConfirmed === false) {
-              warning =
-                'Akun langsung aktif di Server Sekolah tanpa verifikasi email. Agar login Supabase di perangkat luar juga tanpa verifikasi email, jalankan SQL terbaru di tab Database Supabase & SQL atau nonaktifkan "Confirm email" di Supabase Dashboard.';
-            }
+          if (sbMirror && sbMirror.ok && sbMirror.autoConfirmed === false) {
+            warning =
+              'Akun langsung aktif di Server Sekolah tanpa verifikasi email. Agar login Supabase di perangkat luar juga tanpa verifikasi email, jalankan SQL terbaru di tab Database Supabase & SQL.';
           }
-          setUsers((prev) => [...prev, createdUser]);
-          if (createdUser.role === 'wali_kelas' && createdUser.assignedClassId) {
-            setClasses((prev) =>
-              prev.map((c) =>
-                c.id === createdUser.assignedClassId
-                  ? { ...c, homeroomTeacherId: createdUser.id }
-                  : c
-              )
+        }
+        setUsers((prev) => {
+          if (prev.some((u) => u.email.toLowerCase() === createdUser.email.toLowerCase())) {
+            return prev.map((u) =>
+              u.email.toLowerCase() === createdUser.email.toLowerCase() ? createdUser : u
             );
           }
-          await refreshAuthStatus();
-          return { ok: true, warning };
+          return [...prev, createdUser];
+        });
+        if (createdUser.role === 'wali_kelas' && createdUser.assignedClassId) {
+          setClasses((prev) =>
+            prev.map((c) =>
+              c.id === createdUser.assignedClassId
+                ? { ...c, homeroomTeacherId: createdUser.id }
+                : c
+            )
+          );
         }
-      } catch {
-        // fall through to direct Supabase mode if /api is unreachable
+        await refreshAuthStatus();
+        return { ok: true, warning };
       }
+    } catch {
+      // fall through to direct Supabase mode if /api is unreachable
     }
 
     const sbCreated = await syncNewUserToSupabase();
@@ -1942,7 +2051,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       ok: true,
       warning:
         sbCreated.autoConfirmed === false
-          ? 'Akun tersimpan di Supabase, tetapi pengaturan "Confirm email" Supabase masih aktif. Jalankan SQL terbaru di tab Database Supabase & SQL atau matikan "Confirm email" di Supabase Dashboard -> Authentication -> Providers -> Email agar langsung aktif tanpa verifikasi email.'
+          ? 'Akun tersimpan di Supabase, tetapi pengaturan "Confirm email" Supabase masih aktif. Jalankan SQL terbaru di tab Database Supabase & SQL agar langsung aktif tanpa verifikasi email.'
           : undefined,
     };
   };
@@ -1963,92 +2072,156 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return { ok: false, error: 'Hanya Admin Sekolah yang dapat memperbarui akun.' };
     }
 
-    if (authToken) {
+    const syncUserPatchToSupabase = async (): Promise<{
+      ok: boolean;
+      skipped?: boolean;
+      error?: string;
+    }> => {
+      const client = getSupabaseClient();
+      if (!client || !isUuid(userId)) {
+        return { ok: true, skipped: true };
+      }
+      const { data: sessionCheck } = await client.auth.getSession();
+      if (!sessionCheck.session) {
+        return { ok: true, skipped: true };
+      }
+
       try {
-        const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${authToken}`,
-          },
-          body: JSON.stringify(patch),
+        const { error: rpcErr } = await client.rpc('admin_update_user', {
+          p_user_id: userId,
+          p_full_name: patch.fullName !== undefined ? patch.fullName.trim() : null,
+          p_nip_nuptk: patch.nipNuptk !== undefined ? patch.nipNuptk.trim() : null,
+          p_nrks: patch.nrks !== undefined ? patch.nrks.trim() : null,
+          p_role: patch.role ?? null,
+          p_is_active: patch.isActive ?? null,
+          p_assigned_class_id:
+            typeof patch.assignedClassId === 'string' ? patch.assignedClassId : null,
+          p_clear_assigned_class:
+            patch.assignedClassId === null ||
+            (patch.role !== undefined && patch.role !== 'wali_kelas'),
+          p_new_password: patch.newPassword || null,
         });
-        const parsed = await safeParseAuthResponse<{ user?: AuthUserSummary; error?: string }>(res);
-        if (!parsed.rawError) {
-          const data = parsed.data || {};
-          if (!parsed.ok || !data.user) {
-            return { ok: false, error: data.error || 'Gagal memperbarui akun.' };
-          }
-          const updatedUser = data.user;
-          setUsers((prev) => prev.map((u) => (u.id === userId ? updatedUser : u)));
-          if (currentUser?.id === userId) {
-            setCurrentUser(updatedUser);
-          }
-          if (updatedUser.role === 'wali_kelas' && updatedUser.assignedClassId) {
-            setClasses((prev) =>
-              prev.map((c) =>
-                c.id === updatedUser.assignedClassId
-                  ? { ...c, homeroomTeacherId: updatedUser.id }
-                  : c
-              )
-            );
-          }
-          await refreshAuthStatus();
+        if (!rpcErr) {
           return { ok: true };
         }
+        const msg = rpcErr.message.toLowerCase();
+        const code = rpcErr.code || '';
+        const missingOrNoPriv =
+          code === '42883' ||
+          code === 'PGRST202' ||
+          msg.includes('could not find the function') ||
+          msg.includes('does not exist');
+        if (!missingOrNoPriv) {
+          return { ok: false, error: rpcErr.message };
+        }
       } catch {
-        // fall through to Supabase update if /api is unreachable
+        // Fall through to profiles table update
       }
+
+      if (patch.newPassword) {
+        return {
+          ok: false,
+          error:
+            'Reset kata sandi langsung di Supabase membutuhkan fungsi SQL admin_update_user. Jalankan skrip SQL terbaru di tab Database Supabase & SQL.',
+        };
+      }
+
+      const updatePayload: Record<string, unknown> = {};
+      if (patch.fullName !== undefined) updatePayload.full_name = patch.fullName.trim();
+      if (patch.nipNuptk !== undefined) updatePayload.nip_nuptk = patch.nipNuptk.trim();
+      if (patch.nrks !== undefined) updatePayload.nrks = patch.nrks.trim();
+      if (patch.role !== undefined) updatePayload.role = patch.role;
+      if (patch.isActive !== undefined) updatePayload.is_active = patch.isActive;
+      if (patch.assignedClassId !== undefined || (patch.role && patch.role !== 'wali_kelas')) {
+        updatePayload.assigned_class_id =
+          patch.role && patch.role !== 'wali_kelas'
+            ? null
+            : isUuid(patch.assignedClassId)
+              ? patch.assignedClassId
+              : null;
+      }
+
+      const { error } = await client
+        .from('profiles')
+        .update(updatePayload)
+        .eq('id', userId);
+      if (error) {
+        return { ok: false, error: `Gagal memperbarui profil di Supabase: ${error.message}` };
+      }
+      return { ok: true };
+    };
+
+    const applyLocalUserAndClassSync = (updatedUser: AuthUserSummary) => {
+      setUsers((prev) => prev.map((u) => (u.id === userId ? updatedUser : u)));
+      if (currentUser?.id === userId) {
+        setCurrentUser(updatedUser);
+      }
+      setClasses((prev) =>
+        prev.map((c) => {
+          if (updatedUser.role === 'wali_kelas' && updatedUser.assignedClassId === c.id) {
+            return { ...c, homeroomTeacherId: updatedUser.id };
+          }
+          if (c.homeroomTeacherId === updatedUser.id) {
+            return { ...c, homeroomTeacherId: undefined };
+          }
+          return c;
+        })
+      );
+    };
+
+    let expressUpdatedUser: AuthUserSummary | null = null;
+    try {
+      const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: buildExpressHeaders(authToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify(patch),
+      });
+      const parsed = await safeParseAuthResponse<{ user?: AuthUserSummary; error?: string }>(res);
+      if (!parsed.rawError && parsed.status !== 401) {
+        const data = parsed.data || {};
+        if (!parsed.ok && parsed.status !== 404) {
+          return { ok: false, error: data.error || 'Gagal memperbarui akun.' };
+        }
+        if (parsed.ok && data.user) {
+          expressUpdatedUser = data.user;
+        }
+      }
+    } catch {
+      // fall through to Supabase update if /api is unreachable
     }
 
-    const client = getSupabaseClient();
-    if (!client) {
-      return { ok: false, error: 'Sesi server tidak tersedia dan Supabase belum dikonfigurasi.' };
-    }
-    if (patch.newPassword) {
-      return {
-        ok: false,
-        error:
-          'Reset kata sandi langsung memerlukan koneksi server (/api) aktif atau dilakukan melalui Supabase Dashboard → Authentication → Users.',
-      };
+    const sbRes = await syncUserPatchToSupabase();
+    if (!sbRes.ok && !expressUpdatedUser) {
+      return { ok: false, error: sbRes.error || 'Gagal memperbarui akun pengguna.' };
     }
 
     const target = users.find((u) => u.id === userId);
-    const updatePayload: Record<string, unknown> = {};
-    if (patch.fullName !== undefined) updatePayload.full_name = patch.fullName.trim();
-    if (patch.nipNuptk !== undefined) updatePayload.nip_nuptk = patch.nipNuptk.trim();
-    if (patch.nrks !== undefined) updatePayload.nrks = patch.nrks.trim();
-    if (patch.role !== undefined) updatePayload.role = patch.role;
-
-    const { error } = await client
-      .from('profiles')
-      .update(updatePayload)
-      .eq('id', userId);
-    if (error) {
-      return { ok: false, error: `Gagal memperbarui profil di Supabase: ${error.message}` };
-    }
-
-    const updatedUser: AuthUserSummary = {
+    const mergedRole = expressUpdatedUser?.role || patch.role || target?.role || 'guru';
+    const updatedUser: AuthUserSummary = expressUpdatedUser || {
       ...(target || {
         id: userId,
         email: '',
         fullName: patch.fullName || '',
         nipNuptk: '',
-        role: patch.role || 'guru',
+        role: mergedRole,
       }),
       ...(patch.fullName !== undefined ? { fullName: patch.fullName.trim() } : {}),
       ...(patch.nipNuptk !== undefined ? { nipNuptk: patch.nipNuptk.trim() } : {}),
       ...(patch.nrks !== undefined ? { nrks: patch.nrks.trim() } : {}),
-      ...(patch.role !== undefined ? { role: patch.role } : {}),
+      role: mergedRole,
       ...(patch.isActive !== undefined ? { isActive: patch.isActive } : {}),
-      ...(patch.assignedClassId !== undefined
-        ? { assignedClassId: patch.assignedClassId || undefined }
-        : {}),
+      assignedClassId:
+        mergedRole === 'wali_kelas'
+          ? patch.assignedClassId === null
+            ? undefined
+            : patch.assignedClassId ?? target?.assignedClassId
+          : undefined,
+      ...(patch.newPassword ? { hasPassword: true } : {}),
     };
-    setUsers((prev) => prev.map((u) => (u.id === userId ? updatedUser : u)));
-    if (currentUser?.id === userId) {
-      setCurrentUser(updatedUser);
-    }
+
+    applyLocalUserAndClassSync(updatedUser);
+    await refreshAuthStatus();
     return { ok: true };
   };
 
@@ -2056,41 +2229,85 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (!currentUser || currentUser.role !== 'admin') {
       return { ok: false, error: 'Hanya Admin Sekolah yang dapat menghapus akun.' };
     }
+    if (currentUser.id === userId) {
+      return { ok: false, error: 'Tidak dapat menghapus akun yang sedang digunakan.' };
+    }
 
-    if (authToken) {
-      try {
-        const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
-          method: 'DELETE',
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-        const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
-        if (!parsed.rawError) {
-          const data = parsed.data || {};
-          if (!parsed.ok) {
-            return { ok: false, error: data.error || 'Gagal menghapus akun.' };
-          }
-          setUsers((prev) => prev.filter((u) => u.id !== userId));
-          await refreshAuthStatus();
-          return { ok: true };
+    let expressDeleted = false;
+    try {
+      const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: buildExpressHeaders(authToken),
+      });
+      const parsed = await safeParseAuthResponse<{ ok?: boolean; error?: string }>(res);
+      if (!parsed.rawError && parsed.status !== 401) {
+        const data = parsed.data || {};
+        if (!parsed.ok && parsed.status !== 404) {
+          return { ok: false, error: data.error || 'Gagal menghapus akun.' };
         }
-      } catch {
-        // fall through to Supabase profile delete if /api is unreachable
+        if (parsed.ok) {
+          expressDeleted = true;
+        }
       }
+    } catch {
+      // fall through to Supabase profile delete if /api is unreachable
     }
 
     const client = getSupabaseClient();
-    if (!client) {
-      return { ok: false, error: 'Sesi server tidak tersedia dan Supabase belum dikonfigurasi.' };
+    let supabaseHandled = false;
+    if (client && isUuid(userId)) {
+      const { data: sessionCheck } = await client.auth.getSession();
+      if (sessionCheck.session) {
+        try {
+          const { error: rpcErr } = await client.rpc('admin_delete_user', { p_user_id: userId });
+          if (!rpcErr) {
+            supabaseHandled = true;
+          } else {
+            const msg = rpcErr.message.toLowerCase();
+            const code = rpcErr.code || '';
+            const missingOrNoPriv =
+              code === '42883' ||
+              code === 'PGRST202' ||
+              msg.includes('could not find the function') ||
+              msg.includes('does not exist');
+            if (!missingOrNoPriv) {
+              if (!expressDeleted) {
+                return { ok: false, error: rpcErr.message };
+              }
+            } else {
+              const { error: delErr } = await client.from('profiles').delete().eq('id', userId);
+              if (!delErr) supabaseHandled = true;
+            }
+          }
+        } catch {
+          const { error: delErr } = await client.from('profiles').delete().eq('id', userId);
+          if (!delErr) supabaseHandled = true;
+        }
+      }
     }
-    const { error } = await client.from('profiles').delete().eq('id', userId);
-    if (error) {
-      return { ok: false, error: `Gagal menghapus profil di Supabase: ${error.message}` };
+
+    if (!expressDeleted && !supabaseHandled) {
+      return { ok: false, error: 'Sesi server tidak tersedia dan Supabase belum terhubung.' };
     }
+
     setUsers((prev) => prev.filter((u) => u.id !== userId));
+    setClasses((prev) =>
+      prev.map((c) => (c.homeroomTeacherId === userId ? { ...c, homeroomTeacherId: undefined } : c))
+    );
+    setSubjects((prev) =>
+      prev.map((s) => (s.teacherId === userId ? { ...s, teacherId: undefined } : s))
+    );
+    await refreshAuthStatus();
     return { ok: true };
   };
 
   const logout = async () => {
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    }).catch(() => {});
     const client = getSupabaseClient();
     if (client) {
       await client.auth.signOut().catch(() => {});
@@ -2102,6 +2319,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
 
 
+  const recheckSupabaseHealth = async () => {
+    const cfg = await loadServerSupabaseConfig();
+    setSupabaseConfigSource(cfg.source);
+    if (!cfg.url || !cfg.anonKey) {
+      setConnectionMode('offline');
+      setSupabaseEmailDisabled(false);
+      setSupabaseSessionActive(false);
+      setSyncStatus('saved_local');
+      setSupabaseMessage('Konfigurasi Supabase belum diisi.');
+      return;
+    }
+    const res = await testSupabaseConnection();
+    setSupabaseSessionActive(Boolean(res.hasSession));
+    setSupabaseEmailDisabled(Boolean(res.emailProviderDisabled));
+    setConnectionMode(res.ok ? 'supabase' : 'offline');
+    setSyncStatus(
+      !res.ok || res.emailProviderDisabled
+        ? 'error'
+        : !res.hasSession || res.tablesReady
+          ? 'connected'
+          : 'error'
+    );
+    setSupabaseMessage(res.message);
+  };
+
   const configureSupabase = async (url: string, anonKey: string) => {
     saveRuntimeSupabaseConfig(url, anonKey);
     const remoteSave = await saveServerSupabaseConfigRemote(url, anonKey, authToken);
@@ -2110,6 +2352,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     const res = await testSupabaseConnection();
     setSupabaseSessionActive(Boolean(res.hasSession));
+    setSupabaseEmailDisabled(Boolean(res.emailProviderDisabled));
     let finalMsg = res.message;
     if (res.ok && remoteSave.ok) {
       finalMsg = `${res.message} Tersimpan permanen di server — otomatis aktif saat dibuka di browser atau perangkat lain.`;
@@ -2117,9 +2360,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       finalMsg = `${res.message} (Catatan server: ${remoteSave.error})`;
     }
 
-    if (res.ok) {
+    if (res.ok && !res.emailProviderDisabled) {
       setConnectionMode('supabase');
-      setSyncStatus(res.hasSession && res.tablesReady ? 'connected' : 'error');
+      setSyncStatus(!res.hasSession || res.tablesReady ? 'connected' : 'error');
       if (res.hasSession) {
         await syncFromSupabaseInternal().catch(() => {});
       }
@@ -2128,7 +2371,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setSyncStatus('error');
     }
     setSupabaseMessage(finalMsg);
-    return { ok: res.ok, message: finalMsg };
+    return { ok: res.ok && !res.emailProviderDisabled, message: finalMsg };
   };
 
   const disconnectSupabase = async () => {
@@ -2138,10 +2381,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setSupabaseConfigSource(activeCfg.source);
     if (activeCfg.url && activeCfg.anonKey) {
       const res = await testSupabaseConnection();
+      setSupabaseEmailDisabled(Boolean(res.emailProviderDisabled));
       setConnectionMode(res.ok ? 'supabase' : 'offline');
-      setSyncStatus(res.ok ? 'connected' : 'saved_local');
+      setSyncStatus(res.ok && !res.emailProviderDisabled ? 'connected' : 'saved_local');
       setSupabaseMessage(res.message);
     } else {
+      setSupabaseEmailDisabled(false);
       setConnectionMode('offline');
       setSyncStatus('saved_local');
       setSupabaseMessage('Koneksi Supabase dihapus. Kembali ke Mode Offline-Fallback lokal.');
@@ -2226,6 +2471,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         supabaseMessage,
         supabaseConfigSource,
         supabaseSessionActive,
+        supabaseEmailDisabled,
+        recheckSupabaseHealth,
         settings,
         users,
         classes,

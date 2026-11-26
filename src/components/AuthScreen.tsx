@@ -29,6 +29,8 @@ export function AuthScreen() {
     claimFirstAdmin,
     settings,
     connectionMode,
+    supabaseEmailDisabled,
+    recheckSupabaseHealth,
   } = useApp();
 
   const [authTab, setAuthTab] = useState<'login' | 'claim_admin'>('login');
@@ -46,6 +48,7 @@ export function AuthScreen() {
 
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [checkingSupabase, setCheckingSupabase] = useState(false);
 
   const supabaseCfg = getSupabaseConfig();
   const isSupabaseConnected =
@@ -276,6 +279,51 @@ export function AuthScreen() {
             )
           )}
 
+          {supabaseEmailDisabled && (
+            <div className="mb-4 p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-950 space-y-2">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-semibold text-amber-950">
+                      Login Email di Supabase Sedang Dinonaktifkan
+                    </div>
+                    <p className="text-amber-900/90 mt-0.5 leading-relaxed">
+                      Aplikasi sudah terhubung ke project Supabase, namun fitur{' '}
+                      <span className="font-semibold">Enable Email provider</span> di Supabase Auth
+                      sedang dalam posisi <span className="font-semibold">OFF</span> sehingga semua
+                      login ditolak (<code className="font-mono text-[11px]">email_provider_disabled</code>).
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={checkingSupabase}
+                  onClick={async () => {
+                    setCheckingSupabase(true);
+                    await recheckSupabaseHealth();
+                    setCheckingSupabase(false);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold text-amber-950 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg shrink-0 disabled:opacity-60"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${checkingSupabase ? 'animate-spin' : ''}`} />
+                  <span>{checkingSupabase ? 'Mengecek...' : 'Cek Ulang Supabase'}</span>
+                </button>
+              </div>
+              <ol className="list-decimal list-inside space-y-0.5 text-[11px] text-amber-900 pl-6">
+                <li>
+                  Buka <span className="font-semibold">Supabase Dashboard → Authentication → Sign In / Providers → Email</span>.
+                </li>
+                <li>
+                  Aktifkan toggle <span className="font-semibold">Enable Email provider</span> (ON) lalu klik <span className="font-semibold">Save</span>.
+                </li>
+                <li>
+                  Untuk memblokir pendaftaran mandiri publik, cukup matikan <span className="font-semibold">Allow new users to sign up</span> (biarkan Email provider tetap aktif).
+                </li>
+              </ol>
+            </div>
+          )}
+
           {canClaimAdmin && (
             <div className="inline-flex flex-wrap p-1 bg-slate-100 rounded-xl border border-slate-200 mb-5 self-start">
               <button
@@ -329,6 +377,7 @@ export function AuthScreen() {
                   <input
                     type="text"
                     required
+                    autoComplete="name"
                     value={claimName}
                     onChange={(e) => setClaimName(e.target.value)}
                     className="w-full px-3 py-2 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
@@ -354,6 +403,7 @@ export function AuthScreen() {
                 <input
                   type="email"
                   required
+                  autoComplete="email"
                   value={claimEmail}
                   onChange={(e) => setClaimEmail(e.target.value)}
                   className="w-full px-3 py-2 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-emerald-700"
@@ -369,6 +419,7 @@ export function AuthScreen() {
                     type="password"
                     required
                     minLength={6}
+                    autoComplete="new-password"
                     value={claimPassword}
                     onChange={(e) => setClaimPassword(e.target.value)}
                     placeholder="Masukkan sandi baru"
@@ -383,6 +434,7 @@ export function AuthScreen() {
                     type="password"
                     required
                     minLength={6}
+                    autoComplete="new-password"
                     value={claimConfirm}
                     onChange={(e) => setClaimConfirm(e.target.value)}
                     placeholder="Ulangi kata sandi"
@@ -451,6 +503,7 @@ export function AuthScreen() {
                   <input
                     type="email"
                     required
+                    autoComplete="username"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     className="w-full px-3.5 py-2.5 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-700 transition-colors"
@@ -466,6 +519,7 @@ export function AuthScreen() {
                     <input
                       type={showPassword ? 'text' : 'password'}
                       required
+                      autoComplete="current-password"
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       className="w-full px-3.5 py-2.5 pr-10 text-sm bg-slate-50/70 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-700 transition-colors"

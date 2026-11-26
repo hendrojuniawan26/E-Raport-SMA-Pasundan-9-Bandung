@@ -34,12 +34,107 @@ interface AuthenticatedRequest extends Request {
 }
 
 const PORT = Number(process.env.PORT) || 3000;
+const SESSION_COOKIE_NAME = 'eraport_session';
+const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
 const SESSION_SECRET =
   process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const DATA_DIR = path.resolve(process.cwd(), '.data');
 const USERS_FILE = path.join(DATA_DIR, 'auth-users.json');
 const SUPABASE_CONFIG_FILE = path.join(DATA_DIR, 'supabase-config.json');
 const SCHOOL_STATE_FILE = path.join(DATA_DIR, 'school-state.json');
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUuid(val: unknown): val is string {
+  return typeof val === 'string' && UUID_REGEX.test(val.trim());
+}
+
+function sanitizeJsonValue<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeJsonValue(item)) as unknown as T;
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+      out[k] = sanitizeJsonValue(v);
+    }
+    return out as T;
+  }
+  return value;
+}
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!cookieHeader) return result;
+  for (const part of cookieHeader.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = part.slice(0, eqIdx).trim();
+    const rawVal = part.slice(eqIdx + 1).trim();
+    if (!key) continue;
+    try {
+      result[key] = decodeURIComponent(rawVal);
+    } catch {
+      result[key] = rawVal;
+    }
+  }
+  return result;
+}
+
+function isHttpsRequest(req: Request): boolean {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return req.secure || forwardedProto === 'https';
+}
+
+function setSessionCookie(req: Request, res: Response, token: string): void {
+  const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
+  const https = isHttpsRequest(req);
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    `Max-Age=${maxAgeSec}`,
+    'HttpOnly',
+    https ? 'SameSite=None' : 'SameSite=Lax',
+  ];
+  if (https) {
+    parts.push('Secure', 'Partitioned');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(req: Request, res: Response): void {
+  const https = isHttpsRequest(req);
+  const parts = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'Max-Age=0',
+    'HttpOnly',
+    https ? 'SameSite=None' : 'SameSite=Lax',
+  ];
+  if (https) {
+    parts.push('Secure', 'Partitioned');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function isSameOriginMutationAllowed(req: Request): boolean {
+  const xRequestedWith = String(req.headers['x-requested-with'] || '');
+  if (xRequestedWith !== 'XMLHttpRequest') {
+    return false;
+  }
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  const origin = req.headers.origin;
+  if (origin && host) {
+    try {
+      const originHost = new URL(origin).host;
+      if (originHost !== host) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
 
 interface StoredSupabaseConfig {
   url: string;
@@ -226,7 +321,7 @@ function verifyEnvPasscode(candidate: string): boolean {
 function signSessionToken(payload: Omit<SessionPayload, 'exp'>): string {
   const fullPayload: SessionPayload = {
     ...payload,
-    exp: Date.now() + 1000 * 60 * 60 * 12, // 12 hours
+    exp: Date.now() + SESSION_TTL_MS,
   };
   const encoded = Buffer.from(JSON.stringify(fullPayload)).toString('base64url');
   const sig = crypto
@@ -303,13 +398,33 @@ function isAdminClaimed(users: StoredAuthUser[]): boolean {
 
 function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   const header = req.headers.authorization || '';
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (!match) {
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(header);
+  let token = bearerMatch ? bearerMatch[1] : '';
+  let authenticatedViaCookie = false;
+
+  if (!token) {
+    const cookies = parseCookies(req.headers.cookie);
+    if (cookies[SESSION_COOKIE_NAME]) {
+      token = cookies[SESSION_COOKIE_NAME];
+      authenticatedViaCookie = true;
+    }
+  }
+
+  if (!token) {
     res.status(401).json({ error: 'Sesi autentikasi tidak ditemukan. Silakan masuk terlebih dahulu.' });
     return;
   }
 
-  const payload = verifySessionToken(match[1]);
+  if (
+    authenticatedViaCookie &&
+    ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase()) &&
+    !isSameOriginMutationAllowed(req)
+  ) {
+    res.status(403).json({ error: 'Permintaan ditolak oleh validasi keamanan asal permintaan.' });
+    return;
+  }
+
+  const payload = verifySessionToken(token);
   if (!payload) {
     res.status(401).json({ error: 'Sesi login tidak valid atau telah berakhir.' });
     return;
@@ -333,6 +448,84 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
     return;
   }
   next();
+}
+
+function syncHomeroomAssignmentInSchoolState(
+  userId: string,
+  role: UserRole,
+  assignedClassId?: string
+): void {
+  const existing = loadSchoolState();
+  if (!existing || !Array.isArray(existing.classes)) return;
+  let changed = false;
+  const nextClasses = existing.classes.map((cls) => {
+    if (!cls || typeof cls !== 'object') return cls;
+    const c = cls as Record<string, unknown>;
+    const classId = String(c.id || '');
+    if (role === 'wali_kelas' && assignedClassId && classId === assignedClassId) {
+      if (c.homeroomTeacherId !== userId) {
+        changed = true;
+        return { ...c, homeroomTeacherId: userId };
+      }
+      return c;
+    }
+    if (c.homeroomTeacherId === userId) {
+      changed = true;
+      return { ...c, homeroomTeacherId: undefined };
+    }
+    return c;
+  });
+  if (changed) {
+    saveSchoolState({
+      ...existing,
+      classes: nextClasses,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+}
+
+function clearTeacherReferencesInSchoolState(userId: string): void {
+  const existing = loadSchoolState();
+  if (!existing) return;
+  let changed = false;
+  const nextClasses = Array.isArray(existing.classes)
+    ? existing.classes.map((cls) => {
+        if (!cls || typeof cls !== 'object') return cls;
+        const c = cls as Record<string, unknown>;
+        if (c.homeroomTeacherId === userId) {
+          changed = true;
+          return { ...c, homeroomTeacherId: undefined };
+        }
+        return c;
+      })
+    : existing.classes;
+  const nextSubjects = Array.isArray(existing.subjects)
+    ? existing.subjects.map((sub) => {
+        if (!sub || typeof sub !== 'object') return sub;
+        const s = sub as Record<string, unknown>;
+        if (s.teacherId === userId) {
+          changed = true;
+          return { ...s, teacherId: undefined };
+        }
+        return s;
+      })
+    : existing.subjects;
+  if (changed) {
+    saveSchoolState({
+      ...existing,
+      classes: nextClasses,
+      subjects: nextSubjects,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+}
+
+function getSupabaseAdminCreds(): { serviceRoleKey: string; supabaseUrl: string } {
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const envCfg = getEnvSupabaseConfig();
+  const savedCfg = loadSavedSupabaseConfig();
+  const supabaseUrl = envCfg.url || savedCfg.url;
+  return { serviceRoleKey, supabaseUrl };
 }
 
 async function startServer() {
@@ -489,6 +682,7 @@ async function startServer() {
 
     saveUsers(users);
     const token = signSessionToken({ sub: adminUser.id, role: 'admin', isDemo: false });
+    setSessionCookie(req, res, token);
     res.json({ token, user: sanitizeUser(adminUser, true) });
   });
 
@@ -557,7 +751,41 @@ async function startServer() {
     }
 
     const token = signSessionToken({ sub: user.id, role: user.role, isDemo: false });
+    setSessionCookie(req, res, token);
     res.json({ token, user: sanitizeUser(user, true) });
+  });
+
+  // Logout (clear HttpOnly session cookie)
+  app.post('/api/auth/logout', (req, res) => {
+    clearSessionCookie(req, res);
+    res.json({ ok: true });
+  });
+
+  // Non-failing session check for initial app load (avoids 401 browser console error when logged out)
+  app.get('/api/auth/session', (req, res) => {
+    const header = req.headers.authorization || '';
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(header);
+    let token = bearerMatch ? bearerMatch[1] : '';
+    if (!token) {
+      const cookies = parseCookies(req.headers.cookie);
+      token = cookies[SESSION_COOKIE_NAME] || '';
+    }
+    if (!token) {
+      res.json({ authenticated: false, user: null });
+      return;
+    }
+    const payload = verifySessionToken(token);
+    if (!payload) {
+      res.json({ authenticated: false, user: null });
+      return;
+    }
+    const users = loadUsers();
+    const user = users.find((u) => u.id === payload.sub);
+    if (!user || !user.isActive) {
+      res.json({ authenticated: false, user: null });
+      return;
+    }
+    res.json({ authenticated: true, user: sanitizeUser(user, true) });
   });
 
   // Validate active session
@@ -568,8 +796,7 @@ async function startServer() {
   });
 
   // Change own password (for authenticated users)
-  app.post('/api/auth/change-password', requireAuth, (req: AuthenticatedRequest, res) => {
-
+  app.post('/api/auth/change-password', requireAuth, async (req: AuthenticatedRequest, res) => {
     const { currentPassword, newPassword } = req.body as {
       currentPassword?: string;
       newPassword?: string;
@@ -610,6 +837,19 @@ async function startServer() {
       updatedAt: new Date().toISOString(),
     };
     saveUsers(users);
+
+    const { serviceRoleKey, supabaseUrl } = getSupabaseAdminCreds();
+    if (serviceRoleKey && supabaseUrl && isUuid(currentUser.id)) {
+      await fetch(`${supabaseUrl}/auth/v1/admin/users/${currentUser.id}`, {
+        method: 'PUT',
+        headers: {
+          apikey: serviceRoleKey,
+          Authorization: `Bearer ${serviceRoleKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ password: newPassword }),
+      }).catch(() => {});
+    }
 
     res.json({ ok: true, message: 'Kata sandi berhasil diperbarui.' });
   });
@@ -716,6 +956,8 @@ async function startServer() {
                 nip_nuptk: cleanNip,
                 nrks: cleanNrks,
                 role,
+                is_active: true,
+                assigned_class_id: isUuid(cleanAssignedClassId) ? cleanAssignedClassId : null,
               }),
             }).catch(() => {});
           }
@@ -744,11 +986,14 @@ async function startServer() {
 
     users.push(created);
     saveUsers(users);
+    if (created.role === 'wali_kelas' && created.assignedClassId) {
+      syncHomeroomAssignmentInSchoolState(created.id, created.role, created.assignedClassId);
+    }
     res.status(201).json({ user: sanitizeUser(created, true), supabaseConfirmed });
   });
 
   // Admin: Update user profile, role, active state, or reset password
-  app.patch('/api/users/:id', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  app.patch('/api/users/:id', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res) => {
     const targetId = req.params.id;
     const { fullName, nipNuptk, nrks, role, isActive, assignedClassId, newPassword } = req.body as {
       fullName?: string;
@@ -775,6 +1020,13 @@ async function startServer() {
     }
 
     const nextIsActive = typeof isActive === 'boolean' ? isActive : current.isActive;
+    if (req.authUser!.id === current.id && (nextRole !== 'admin' || !nextIsActive)) {
+      res.status(400).json({
+        error: 'Anda tidak dapat menurunkan role atau menonaktifkan akun Anda sendiri.',
+      });
+      return;
+    }
+
     const activeAdminsAfter = users.filter((u) =>
       u.id === current.id ? nextRole === 'admin' && nextIsActive : u.role === 'admin' && u.isActive
     ).length;
@@ -788,7 +1040,8 @@ async function startServer() {
 
     let nextSalt = current.passwordSalt;
     let nextHash = current.passwordHash;
-    if (typeof newPassword === 'string' && newPassword.length > 0) {
+    const hasNewPassword = typeof newPassword === 'string' && newPassword.length > 0;
+    if (hasNewPassword) {
       if (newPassword.length < 6) {
         res.status(400).json({ error: 'Kata sandi baru minimal 6 karakter.' });
         return;
@@ -823,11 +1076,56 @@ async function startServer() {
 
     users[idx] = updated;
     saveUsers(users);
+    syncHomeroomAssignmentInSchoolState(updated.id, updated.role, updated.assignedClassId);
+
+    const { serviceRoleKey, supabaseUrl } = getSupabaseAdminCreds();
+    if (serviceRoleKey && supabaseUrl && isUuid(updated.id)) {
+      const authPatch: Record<string, unknown> = {
+        ban_duration: updated.isActive ? 'none' : '876000h',
+        user_metadata: {
+          full_name: updated.fullName,
+          nip_nuptk: updated.nipNuptk,
+          role: updated.role,
+          assigned_class_id: updated.assignedClassId || null,
+        },
+      };
+      if (hasNewPassword) {
+        authPatch.password = newPassword;
+      }
+      await fetch(`${supabaseUrl}/auth/v1/admin/users/${updated.id}`, {
+        method: 'PUT',
+        headers: {
+          apikey: serviceRoleKey,
+          Authorization: `Bearer ${serviceRoleKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(authPatch),
+      }).catch(() => {});
+
+      await fetch(`${supabaseUrl}/rest/v1/profiles?id=eq.${updated.id}`, {
+        method: 'PATCH',
+        headers: {
+          apikey: serviceRoleKey,
+          Authorization: `Bearer ${serviceRoleKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          full_name: updated.fullName,
+          nip_nuptk: updated.nipNuptk,
+          nrks: updated.nrks,
+          role: updated.role,
+          is_active: updated.isActive,
+          assigned_class_id: isUuid(updated.assignedClassId) ? updated.assignedClassId : null,
+          updated_at: new Date().toISOString(),
+        }),
+      }).catch(() => {});
+    }
+
     res.json({ user: sanitizeUser(updated, true) });
   });
 
   // Admin: Delete user account
-  app.delete('/api/users/:id', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  app.delete('/api/users/:id', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res) => {
     const targetId = req.params.id;
     if (req.authUser!.id === targetId) {
       res.status(400).json({ error: 'Tidak dapat menghapus akun yang sedang digunakan.' });
@@ -849,10 +1147,23 @@ async function startServer() {
     }
 
     saveUsers(remaining);
+    clearTeacherReferencesInSchoolState(targetId);
+
+    const { serviceRoleKey, supabaseUrl } = getSupabaseAdminCreds();
+    if (serviceRoleKey && supabaseUrl && isUuid(targetId)) {
+      await fetch(`${supabaseUrl}/auth/v1/admin/users/${targetId}`, {
+        method: 'DELETE',
+        headers: {
+          apikey: serviceRoleKey,
+          Authorization: `Bearer ${serviceRoleKey}`,
+        },
+      }).catch(() => {});
+    }
+
     res.json({ ok: true });
   });
 
-  // Shared Multi-Teacher Academic State Sync (Protected by Bearer Auth & Role Boundaries)
+  // Shared Multi-Teacher Academic State Sync (Protected by Bearer/HttpOnly Cookie Auth & Role Boundaries)
   app.get('/api/school-state', requireAuth, (_req: AuthenticatedRequest, res) => {
     const state = loadSchoolState();
     if (!state) {
@@ -864,10 +1175,61 @@ async function startServer() {
 
   app.put('/api/school-state', requireAuth, (req: AuthenticatedRequest, res) => {
     const role = req.authUser!.role;
-    const incoming = req.body as Partial<StoredSchoolState>;
+    const incoming = sanitizeJsonValue(req.body as Partial<StoredSchoolState>);
     const existing: StoredSchoolState = loadSchoolState() || {
       updatedAt: new Date().toISOString(),
     };
+
+    const mergeByCompositeKey = (
+      existingArr: unknown[] | undefined,
+      incomingArr: unknown[],
+      keyFn: (item: Record<string, unknown>) => string | null
+    ): unknown[] => {
+      const resultMap = new Map<string, unknown>();
+      const fallbackItems: unknown[] = [];
+      for (const item of existingArr || []) {
+        if (item && typeof item === 'object') {
+          const key = keyFn(item as Record<string, unknown>);
+          if (key) {
+            resultMap.set(key, item);
+            continue;
+          }
+        }
+        fallbackItems.push(item);
+      }
+      for (const item of incomingArr) {
+        if (item && typeof item === 'object') {
+          const key = keyFn(item as Record<string, unknown>);
+          if (key) {
+            resultMap.set(key, item);
+            continue;
+          }
+        }
+        fallbackItems.push(item);
+      }
+      return [...Array.from(resultMap.values()), ...fallbackItems];
+    };
+
+    const gradeKey = (g: Record<string, unknown>) =>
+      g.studentId && g.subjectId
+        ? `${String(g.studentId)}__${String(g.subjectId)}__${String(g.academicYear || '2025/2026')}__${String(g.semester || 'Ganjil')}`
+        : g.id
+          ? String(g.id)
+          : null;
+
+    const homeroomKey = (h: Record<string, unknown>) =>
+      h.studentId
+        ? `${String(h.studentId)}__${String(h.academicYear || '2025/2026')}__${String(h.semester || 'Ganjil')}`
+        : h.id
+          ? String(h.id)
+          : null;
+
+    const submissionKey = (s: Record<string, unknown>) =>
+      s.classId && s.subjectId
+        ? `${String(s.classId)}__${String(s.subjectId)}__${String(s.academicYear || '2025/2026')}__${String(s.semester || 'Ganjil')}`
+        : s.id
+          ? String(s.id)
+          : null;
 
     const next: StoredSchoolState = {
       ...existing,
@@ -890,12 +1252,17 @@ async function startServer() {
         next.gradeSubmissions = incoming.gradeSubmissions;
       }
     } else if (role === 'guru') {
-      if (Array.isArray(incoming.grades)) next.grades = incoming.grades;
+      if (Array.isArray(incoming.grades)) {
+        next.grades = mergeByCompositeKey(existing.grades, incoming.grades, gradeKey);
+      }
       if (Array.isArray(incoming.gradeSubmissions)) {
-        next.gradeSubmissions = incoming.gradeSubmissions;
+        next.gradeSubmissions = mergeByCompositeKey(
+          existing.gradeSubmissions,
+          incoming.gradeSubmissions,
+          submissionKey
+        );
       }
       if (Array.isArray(incoming.subjects) && Array.isArray(existing.subjects)) {
-        // Guru can update TP list & SAS title on existing subjects
         const incomingMap = new Map(
           incoming.subjects
             .filter((s): s is { id: string; tpList?: unknown; sasTitle?: unknown } =>
@@ -915,12 +1282,22 @@ async function startServer() {
         });
       }
     } else if (role === 'wali_kelas') {
-      if (Array.isArray(incoming.grades)) next.grades = incoming.grades;
+      if (Array.isArray(incoming.grades)) {
+        next.grades = mergeByCompositeKey(existing.grades, incoming.grades, gradeKey);
+      }
       if (Array.isArray(incoming.homeroomRecords)) {
-        next.homeroomRecords = incoming.homeroomRecords;
+        next.homeroomRecords = mergeByCompositeKey(
+          existing.homeroomRecords,
+          incoming.homeroomRecords,
+          homeroomKey
+        );
       }
       if (Array.isArray(incoming.gradeSubmissions)) {
-        next.gradeSubmissions = incoming.gradeSubmissions;
+        next.gradeSubmissions = mergeByCompositeKey(
+          existing.gradeSubmissions,
+          incoming.gradeSubmissions,
+          submissionKey
+        );
       }
       if (Array.isArray(incoming.subjects) && Array.isArray(existing.subjects)) {
         const incomingMap = new Map(

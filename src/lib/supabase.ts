@@ -108,16 +108,18 @@ export async function saveServerSupabaseConfigRemote(
   anonKey: string,
   authToken: string | null
 ): Promise<{ ok: boolean; error?: string }> {
-  if (!authToken) {
-    return { ok: false, error: 'Sesi Admin dibutuhkan untuk menyimpan konfigurasi permanen ke server.' };
-  }
   try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+    };
+    if (authToken) {
+      headers.Authorization = `Bearer ${authToken}`;
+    }
     const res = await fetch('/api/config/supabase', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${authToken}`,
-      },
+      credentials: 'same-origin',
+      headers,
       body: JSON.stringify({ url: url.trim(), anonKey: anonKey.trim() }),
     });
     const data = (await res.json()) as { ok?: boolean; error?: string };
@@ -142,14 +144,21 @@ export async function clearServerSupabaseConfigRemote(
   serverConfigCache = { url: '', anonKey: '', source: 'none' };
   cachedClient = null;
   cachedClientSignature = '';
-  if (!authToken) {
-    return { ok: true };
-  }
   try {
+    const headers: Record<string, string> = {
+      'X-Requested-With': 'XMLHttpRequest',
+    };
+    if (authToken) {
+      headers.Authorization = `Bearer ${authToken}`;
+    }
     const res = await fetch('/api/config/supabase', {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${authToken}` },
+      credentials: 'same-origin',
+      headers,
     });
+    if (res.status === 401) {
+      return { ok: true };
+    }
     if (!res.ok) {
       const data = (await res.json()) as { error?: string };
       return { ok: false, error: data.error || 'Gagal menghapus konfigurasi server.' };
@@ -206,6 +215,12 @@ export function createEphemeralSupabaseClient(): SupabaseClient | null {
         persistSession: false,
         autoRefreshToken: false,
         detectSessionInUrl: false,
+        storageKey: `ephemeral-sb-auth-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        storage: {
+          getItem: () => null,
+          setItem: () => {},
+          removeItem: () => {},
+        },
       },
     });
   } catch {
@@ -218,6 +233,7 @@ export async function testSupabaseConnection(): Promise<{
   message: string;
   tablesReady?: boolean;
   hasSession?: boolean;
+  emailProviderDisabled?: boolean;
 }> {
   const cfg = getSupabaseConfig();
   const client = getSupabaseClient();
@@ -233,8 +249,12 @@ export async function testSupabaseConnection(): Promise<{
 
   try {
     const cleanUrl = normalizeSupabaseUrl(cfg.url);
+    const authHeaders = {
+      apikey: cfg.anonKey,
+      Authorization: `Bearer ${cfg.anonKey}`,
+    };
     const healthRes = await fetch(`${cleanUrl}/auth/v1/health`, {
-      headers: { apikey: cfg.anonKey },
+      headers: authHeaders,
     });
     if (!healthRes.ok) {
       return {
@@ -252,8 +272,45 @@ export async function testSupabaseConnection(): Promise<{
           ? 'konfigurasi server permanen (aktif di semua browser)'
           : 'konfigurasi browser lokal';
 
+    let emailProviderDisabled = false;
+    try {
+      const settingsRes = await fetch(`${cleanUrl}/auth/v1/settings`, {
+        headers: authHeaders,
+      });
+      if (settingsRes.ok) {
+        const settingsJson = (await settingsRes.json()) as {
+          external?: { email?: boolean };
+        };
+        if (settingsJson?.external && settingsJson.external.email === false) {
+          emailProviderDisabled = true;
+        }
+      }
+    } catch {
+      // ignore if auth settings endpoint is blocked
+    }
+
     const { data: sessionData } = await client.auth.getSession();
     const hasSession = Boolean(sessionData.session);
+
+    if (emailProviderDisabled) {
+      return {
+        ok: true,
+        tablesReady: false,
+        hasSession,
+        emailProviderDisabled: true,
+        message: `Terhubung ke Supabase (${sourceText}), tetapi provider login Email sedang NONAKTIF ("Email logins are disabled"). Aktifkan "Enable Email provider" di Supabase Dashboard → Authentication → Providers → Email agar akun bisa masuk.`,
+      };
+    }
+
+    if (!hasSession) {
+      return {
+        ok: true,
+        tablesReady: false,
+        hasSession: false,
+        emailProviderDisabled: false,
+        message: `URL & Anon Key Supabase terhubung (${sourceText}). Masuk menggunakan akun yang terdaftar untuk menyinkronkan database sekolah.`,
+      };
+    }
 
     const { error } = await client.from('school_settings').select('id').limit(1);
     if (error) {
@@ -265,11 +322,9 @@ export async function testSupabaseConnection(): Promise<{
       ) {
         return {
           ok: true,
-          tablesReady: !hasSession,
+          tablesReady: false,
           hasSession,
-          message: hasSession
-            ? `Terhubung ke Supabase (${sourceText}), tetapi izin baca tabel ditolak (${error.message}). Pastikan skrip SQL terbaru (termasuk GRANT & RLS Policy) sudah dijalankan di Supabase SQL Editor.`
-            : `URL & Anon Key Supabase terhubung (${sourceText}). Tabel diproteksi RLS — silakan jalankan skrip SQL di Supabase SQL Editor dan masuk memakai akun yang terdaftar di Supabase Authentication agar sinkronisasi database berjalan.`,
+          message: `Terhubung ke Supabase (${sourceText}), tetapi izin baca tabel ditolak (${error.message}). Pastikan skrip SQL terbaru (termasuk GRANT & RLS Policy) sudah dijalankan di Supabase SQL Editor.`,
         };
       }
       return {
@@ -283,6 +338,7 @@ export async function testSupabaseConnection(): Promise<{
       ok: true,
       tablesReady: true,
       hasSession,
+      emailProviderDisabled: false,
       message: `Terhubung penuh ke Supabase (${sourceText}) dan tabel siap disinkronkan.`,
     };
   } catch (err) {

@@ -42,6 +42,7 @@ import {
 
 export function GradeInputView() {
   const {
+    currentUser,
     users,
     classes,
     subjects,
@@ -111,7 +112,11 @@ export function GradeInputView() {
   const getOrInitGrade = (studentId: string): SubjectGrade => {
     const subjectId = selectedSubject?.id || '';
     const existing = grades.find(
-      (g) => g.studentId === studentId && g.subjectId === subjectId
+      (g) =>
+        g.studentId === studentId &&
+        g.subjectId === subjectId &&
+        g.academicYear === settings.academicYear &&
+        g.semester === settings.semester
     );
     if (existing && selectedSubject) {
       return recalculateSubjectGrade(existing, selectedSubject, settings);
@@ -145,7 +150,7 @@ export function GradeInputView() {
   const isLocked = submissionStatus === 'locked' || submissionStatus === 'sent';
   const homeroomTeacher = selectedClass
     ? users.find((u) => u.id === selectedClass.homeroomTeacherId) ||
-      users.find((u) => u.role === 'wali_kelas')
+      users.find((u) => u.role === 'wali_kelas' && u.assignedClassId === selectedClass.id)
     : undefined;
 
   const formatTimestamp = (iso?: string) => {
@@ -398,29 +403,38 @@ export function GradeInputView() {
 
       const nextStudents = [...students];
       const incomingGrades: SubjectGrade[] = [];
+      const skippedNames: string[] = [];
+      let createdStudentCount = 0;
 
       parsed.students.forEach((row) => {
         let stu = nextStudents.find(
           (s) =>
-            s.nis === row.nis ||
-            s.fullName.toLowerCase() === row.fullName.toLowerCase()
+            s.nis.trim() === row.nis.trim() ||
+            (s.classId === selectedClass.id &&
+              s.fullName.toLowerCase() === row.fullName.toLowerCase())
         );
         if (!stu) {
-          stu = {
-            id: generateUuid(),
-            nis: row.nis,
-            nisn: '',
-            fullName: row.fullName,
-            gender: row.gender,
-            classId: selectedClass.id,
-            birthPlace: 'Bandung',
-            birthDate: '2007-01-01',
-            religion: 'Islam',
-            address: '',
-            parentName: '-',
-            isActive: true,
-          };
-          nextStudents.push(stu);
+          if (currentUser?.role === 'admin') {
+            stu = {
+              id: generateUuid(),
+              nis: row.nis,
+              nisn: '',
+              fullName: row.fullName,
+              gender: row.gender,
+              classId: selectedClass.id,
+              birthPlace: 'Bandung',
+              birthDate: '2007-01-01',
+              religion: 'Islam',
+              address: '',
+              parentName: '-',
+              isActive: true,
+            };
+            nextStudents.push(stu);
+            createdStudentCount += 1;
+          } else {
+            skippedNames.push(`${row.fullName} (${row.nis})`);
+            return;
+          }
         }
 
         const tpScores = updatedSubject.tpList.map((tp, idx) => {
@@ -467,11 +481,22 @@ export function GradeInputView() {
         );
       });
 
-      setStudents(nextStudents);
-      bulkUpsertGrades(incomingGrades);
+      if (createdStudentCount > 0) {
+        setStudents(nextStudents);
+      }
+      if (incomingGrades.length > 0) {
+        bulkUpsertGrades(incomingGrades);
+      }
+      const skipWarning =
+        skippedNames.length > 0
+          ? ` ${skippedNames.length} siswa belum terdaftar di kelas ${selectedClass.name} dan dilewati (hubungi Admin untuk menambah siswa baru): ${skippedNames.slice(0, 3).join(', ')}${skippedNames.length > 3 ? ', ...' : ''}.`
+          : '';
       setImportFeedback({
-        type: 'success',
-        text: `Berhasil mengimpor ${incomingGrades.length} nilai siswa (${parsed.detectedSubjectName || updatedSubject.name}) dan menghitung ulang Nilai Rapor & Deskripsi.`,
+        type: incomingGrades.length > 0 ? 'success' : 'error',
+        text:
+          incomingGrades.length > 0
+            ? `Berhasil mengimpor ${incomingGrades.length} nilai siswa (${parsed.detectedSubjectName || updatedSubject.name}) dan menghitung ulang Nilai Rapor & Deskripsi.${skipWarning}`
+            : `Tidak ada nilai yang diimpor karena siswa pada file belum terdaftar di Master Data kelas ${selectedClass.name}.${skipWarning}`,
       });
     } catch (err) {
       setImportFeedback({
@@ -1645,9 +1670,11 @@ export function GradeInputView() {
                   <td className="py-2.5 px-2 border-r border-slate-200 text-center text-[11px] text-slate-600">
                     RT
                   </td>
-                  <td className="py-2.5 px-3 text-[11px] font-normal text-slate-500 flex items-center gap-1.5">
-                    <RefreshCw className="w-3 h-3 text-emerald-700" />
-                    <span>Auto-save & kalkulasi bobot aktif</span>
+                  <td className="py-2.5 px-3 text-[11px] font-normal text-slate-500">
+                    <div className="flex items-center gap-1.5">
+                      <RefreshCw className="w-3 h-3 text-emerald-700" />
+                      <span>Auto-save & kalkulasi bobot aktif</span>
+                    </div>
                   </td>
                 </tr>
               </tfoot>

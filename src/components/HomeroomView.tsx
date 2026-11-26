@@ -68,8 +68,19 @@ export function HomeroomView() {
     classStudents.find((s) => s.id === selectedStudentId) || classStudents[0];
 
   const getRecord = (studentId: string): HomeroomRecord => {
-    const found = homeroomRecords.find((h) => h.studentId === studentId);
+    const found = homeroomRecords.find(
+      (h) =>
+        h.studentId === studentId &&
+        h.academicYear === settings.academicYear &&
+        h.semester === settings.semester
+    );
     if (found) return found;
+    const defaultPromotion =
+      settings.semester === 'Genap'
+        ? selectedClass?.gradeLevel === 12
+          ? 'Lulus dari Satuan Pendidikan'
+          : 'Naik ke kelas berikutnya'
+        : 'Melanjutkan ke Semester Genap';
     return {
       id: generateUuid(),
       studentId,
@@ -79,7 +90,7 @@ export function HomeroomView() {
       izin: 0,
       alpha: 0,
       waliNote: '',
-      promotionStatus: 'Melanjutkan ke Semester Genap',
+      promotionStatus: defaultPromotion,
       extracurriculars: [],
       p5Projects: [],
       updatedAt: new Date().toISOString(),
@@ -130,7 +141,11 @@ export function HomeroomView() {
     const raw = classStudents.map((stu) => {
       const subjectScores = classSubjects.map((sub) => {
         const g = grades.find(
-          (gr) => gr.studentId === stu.id && gr.subjectId === sub.id
+          (gr) =>
+            gr.studentId === stu.id &&
+            gr.subjectId === sub.id &&
+            gr.academicYear === settings.academicYear &&
+            gr.semester === settings.semester
         );
         return g ? recalculateSubjectGrade(g, sub, settings).nilaiAkhir : 0;
       });
@@ -159,7 +174,11 @@ export function HomeroomView() {
       const subGrades = classStudents
         .map((stu) => {
           const found = grades.find(
-            (g) => g.studentId === stu.id && g.subjectId === sub.id
+            (g) =>
+              g.studentId === stu.id &&
+              g.subjectId === sub.id &&
+              g.academicYear === settings.academicYear &&
+              g.semester === settings.semester
           );
           return found ? recalculateSubjectGrade(found, sub, settings) : null;
         })

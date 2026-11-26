@@ -735,6 +735,7 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
                 <input
                   type="password"
                   required
+                  autoComplete="current-password"
                   value={currPw}
                   onChange={(e) => setCurrPw(e.target.value)}
                   className="w-full px-3 py-2 border border-slate-200 rounded-lg"
@@ -748,6 +749,7 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
                   type="password"
                   required
                   minLength={6}
+                  autoComplete="new-password"
                   value={newPw}
                   onChange={(e) => setNewPw(e.target.value)}
                   className="w-full px-3 py-2 border border-slate-200 rounded-lg"

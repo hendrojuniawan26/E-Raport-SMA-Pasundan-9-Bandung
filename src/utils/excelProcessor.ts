@@ -39,6 +39,34 @@ function toNum(val: unknown): number | null {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+function safeExcelCell(val: string | number | null | undefined): string | number {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'number') return Number.isFinite(val) ? val : '';
+  const str = String(val);
+  if (/^[\s]*[=+\-@\t\r]/.test(str)) {
+    const trimmed = str.trim();
+    if (/^-[0-9]+(\.[0-9]+)?$/.test(trimmed)) return Number(trimmed);
+    return `'${str}`;
+  }
+  return str;
+}
+
+function formatExcelDate(val: unknown): string {
+  if (val instanceof Date && !Number.isNaN(val.getTime())) {
+    const y = val.getFullYear();
+    const m = String(val.getMonth() + 1).padStart(2, '0');
+    const d = String(val.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+  if (typeof val === 'number' && Number.isFinite(val) && val > 1000) {
+    const parsed = XLSX.SSF.parse_date_code(val);
+    if (parsed && parsed.y && parsed.m && parsed.d) {
+      return `${String(parsed.y).padStart(4, '0')}-${String(parsed.m).padStart(2, '0')}-${String(parsed.d).padStart(2, '0')}`;
+    }
+  }
+  return String(val ?? '').trim();
+}
+
 /**
  * Parses either the multi-row SMA Pasundan 9 Bandung Excel/CSV template
  * (Olah_Nilai_Kurmer_SMA_Pasundan_9_Bandung / Template Resmi / Export Excel)
@@ -247,22 +275,13 @@ export async function parseGradeExcelFile(
 
   // Detect TP pairs dynamically from headers like "tp 1 ppk", "sumatif 1 ppk", "s1_ppk", etc.
   const tpPairs: { ppk: number; prk: number; title: string }[] = [];
-  for (let idx = 1; idx <= 8; idx++) {
+  for (let idx = 1; idx <= 12; idx++) {
+    const tpTokenRegex = new RegExp(`(^|[^a-z0-9])(tp\\s*${idx}|sumatif\\s*${idx}|s\\s*${idx})([^a-z0-9]|$)`, 'i');
     const ppkIdx = headerRow.findIndex(
-      (h) =>
-        (h.includes(`tp${idx}`) ||
-          h.includes(`tp ${idx}`) ||
-          h.includes(`s${idx}`) ||
-          h.includes(`sumatif ${idx}`)) &&
-        (h.includes('ppk') || !h.includes('prk'))
+      (h) => tpTokenRegex.test(h) && (h.includes('ppk') || !h.includes('prk'))
     );
     const prkIdx = headerRow.findIndex(
-      (h) =>
-        (h.includes(`tp${idx}`) ||
-          h.includes(`tp ${idx}`) ||
-          h.includes(`s${idx}`) ||
-          h.includes(`sumatif ${idx}`)) &&
-        h.includes('prk')
+      (h) => tpTokenRegex.test(h) && h.includes('prk')
     );
     if (ppkIdx >= 0) {
       tpPairs.push({
@@ -361,7 +380,7 @@ export async function parseMasterStudentsExcel(file: File): Promise<
   }[]
 > {
   const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: 'array' });
+  const workbook = XLSX.read(buffer, { type: 'array', cellDates: true });
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   const rows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(sheet, {
     defval: '',
@@ -369,14 +388,15 @@ export async function parseMasterStudentsExcel(file: File): Promise<
 
   return rows
     .map((row) => {
-      const get = (keys: string[]) => {
+      const getRaw = (keys: string[]): unknown => {
         for (const k of Object.keys(row)) {
           if (keys.some((target) => k.toLowerCase().includes(target))) {
-            return String(row[k] ?? '').trim();
+            return row[k];
           }
         }
         return '';
       };
+      const get = (keys: string[]) => String(getRaw(keys) ?? '').trim();
 
       const nis = get(['nis', 'induk']);
       const fullName = get(['nama', 'name']);
@@ -391,7 +411,7 @@ export async function parseMasterStudentsExcel(file: File): Promise<
           : 'L') as Gender,
         className: get(['kelas', 'class']) || 'XI IPAS',
         birthPlace: get(['tempat']) || 'Bandung',
-        birthDate: get(['tanggal', 'lahir']) || '2008-05-14',
+        birthDate: formatExcelDate(getRaw(['tanggal', 'lahir'])) || '2008-05-14',
         religion: get(['agama']) || 'Islam',
         parentName: get(['ortu', 'wali', 'orang tua']) || '-',
         address: get(['alamat']) || 'Bandung',
@@ -410,57 +430,134 @@ export function exportSubjectGradeExcel(
   grades: SubjectGrade[],
   settings: SchoolSettings
 ): void {
-  const aoa: (string | number)[][] = [];
+  const tpList = subject.tpList.length > 0
+    ? subject.tpList
+    : [{ id: 'tp-1', code: 'Sumatif 1', title: 'Tujuan Pembelajaran 1' }];
+  const tpCount = tpList.length;
 
-  aoa.push(['', '', settings.yayasan]);
-  aoa.push(['', '', settings.schoolName]);
-  aoa.push(['', '', settings.address]);
-  aoa.push([]);
-  aoa.push(['DAFTAR NILAI', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '>> FORMAT RESMI E-RAPORT <<']);
-  aoa.push(['Mata Pelajaran:', '', subject.name, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 'KKM']);
-  aoa.push([`Kelas              :  ${classRoom.name}`, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', subject.kktp]);
-  aoa.push([]);
-  aoa.push(['Nomor', '', 'NAMA/KODE PESERTA', 'L/P', 'NILAI']);
-  aoa.push(['', '', '', '', 'Sumatif 1', '', 'Sumatif 2', '', 'Sumatif 3', '', 'Sumatif 4', '', 'Sum. Akhir Semester', '', 'Kehadiran', 'Proses', 'Tugas', 'RAPOR', 'NILAI', 'SIKAP P3', '', '', '', '', '', 'Deskripsi Capaian Kompetensi']);
-  aoa.push(['', '', '', '', subject.tpList[0]?.title || 'TP 1', '', subject.tpList[1]?.title || 'TP 2', '', subject.tpList[2]?.title || 'TP 3', '', subject.tpList[3]?.title || 'TP 4', '', subject.sasTitle || 'SAS', '', '', '', '', 'KOGNITIF', 'AKHIR', 'D.1', 'D.2', 'D.3', 'D.4', 'D.5', 'D.6', '']);
-  aoa.push(['Urt.', 'Induk', '', '', 'PPK', 'PRK', 'PPK', 'PRK', 'PPK', 'PRK', 'PPK', 'PRK', 'PPK', 'PRK', '', '', '', '', '', '', '', '', '', '', '', '']);
+  const sumatifHeaderRow: (string | number)[] = ['', '', '', ''];
+  const tpTitleRow: (string | number)[] = ['', '', '', ''];
+  const ppkPrkRow: (string | number)[] = ['Urt.', 'Induk', '', ''];
+
+  const merges: XLSX.Range[] = [
+    { s: { r: 8, c: 0 }, e: { r: 10, c: 1 } },
+    { s: { r: 8, c: 2 }, e: { r: 11, c: 2 } },
+    { s: { r: 8, c: 3 }, e: { r: 11, c: 3 } },
+  ];
+
+  tpList.forEach((tp, idx) => {
+    const startCol = 4 + idx * 2;
+    sumatifHeaderRow.push(`Sumatif ${idx + 1}`, '');
+    tpTitleRow.push(safeExcelCell(tp.title || `TP ${idx + 1}`), '');
+    ppkPrkRow.push('PPK', 'PRK');
+    merges.push({ s: { r: 9, c: startCol }, e: { r: 9, c: startCol + 1 } });
+    merges.push({ s: { r: 10, c: startCol }, e: { r: 10, c: startCol + 1 } });
+  });
+
+  const sasCol = 4 + tpCount * 2;
+  const p3Col = sasCol + 7;
+  const descCol = sasCol + 13;
+  const kkmCol = p3Col + 5;
+
+  sumatifHeaderRow.push(
+    'Sum. Akhir Semester',
+    '',
+    'Kehadiran',
+    'Proses',
+    'Tugas',
+    'RAPOR',
+    'NILAI',
+    'SIKAP P3',
+    '',
+    '',
+    '',
+    '',
+    '',
+    'Deskripsi Capaian Kompetensi'
+  );
+  tpTitleRow.push(
+    safeExcelCell(subject.sasTitle || 'SAS'),
+    '',
+    '',
+    '',
+    '',
+    'KOGNITIF',
+    'AKHIR',
+    'D.1',
+    'D.2',
+    'D.3',
+    'D.4',
+    'D.5',
+    'D.6',
+    ''
+  );
+  ppkPrkRow.push('PPK', 'PRK', '', '', '', '', '', '', '', '', '', '', '', '');
+
+  merges.push(
+    { s: { r: 8, c: 4 }, e: { r: 8, c: descCol } },
+    { s: { r: 9, c: sasCol }, e: { r: 9, c: sasCol + 1 } },
+    { s: { r: 10, c: sasCol }, e: { r: 10, c: sasCol + 1 } },
+    { s: { r: 9, c: p3Col }, e: { r: 9, c: p3Col + 5 } },
+    { s: { r: 9, c: descCol }, e: { r: 10, c: descCol } }
+  );
+
+  const headerDaftarRow: (string | number)[] = Array(descCol + 1).fill('');
+  headerDaftarRow[0] = 'DAFTAR NILAI';
+  headerDaftarRow[kkmCol] = '>> FORMAT RESMI E-RAPORT <<';
+
+  const mapelRow: (string | number)[] = Array(descCol + 1).fill('');
+  mapelRow[0] = 'Mata Pelajaran:';
+  mapelRow[2] = safeExcelCell(subject.name);
+  mapelRow[kkmCol] = 'KKM';
+
+  const kelasRow: (string | number)[] = Array(descCol + 1).fill('');
+  kelasRow[0] = safeExcelCell(`Kelas              :  ${classRoom.name}`);
+  kelasRow[kkmCol] = subject.kktp;
+
+  const aoa: (string | number)[][] = [
+    ['', '', safeExcelCell(settings.yayasan)],
+    ['', '', safeExcelCell(settings.schoolName)],
+    ['', '', safeExcelCell(settings.address)],
+    [],
+    headerDaftarRow,
+    mapelRow,
+    kelasRow,
+    [],
+    ['Nomor', '', 'NAMA/KODE PESERTA', 'L/P', 'NILAI'],
+    sumatifHeaderRow,
+    tpTitleRow,
+    ppkPrkRow,
+  ];
 
   const raporVals: number[] = [];
 
   students.forEach((student, idx) => {
     const rawGrade = grades.find(
-      (g) => g.studentId === student.id && g.subjectId === subject.id
+      (g) =>
+        g.studentId === student.id &&
+        g.subjectId === subject.id &&
+        g.academicYear === settings.academicYear &&
+        g.semester === settings.semester
     );
     const g = rawGrade
       ? recalculateSubjectGrade(rawGrade, subject, settings)
       : undefined;
 
-    const getTp = (tpIdx: number) => {
-      const tp = subject.tpList[tpIdx];
-      const sc = tp ? g?.tpScores.find((s) => s.tpId === tp.id) : undefined;
-      return [sc?.ppk ?? '', sc?.prk ?? ''];
-    };
+    const tpCells: (string | number)[] = [];
+    tpList.forEach((tp) => {
+      const sc = g?.tpScores.find((s) => s.tpId === tp.id);
+      tpCells.push(sc?.ppk ?? '', sc?.prk ?? '');
+    });
 
-    const s1 = getTp(0);
-    const s2 = getTp(1);
-    const s3 = getTp(2);
-    const s4 = getTp(3);
     const finalScore = g?.nilaiAkhir ?? 0;
     if (finalScore > 0) raporVals.push(finalScore);
 
     aoa.push([
       idx + 1,
-      student.nis,
-      student.fullName,
+      safeExcelCell(student.nis),
+      safeExcelCell(student.fullName),
       student.gender,
-      s1[0],
-      s1[1],
-      s2[0],
-      s2[1],
-      s3[0],
-      s3[1],
-      s4[0],
-      s4[1],
+      ...tpCells,
       g?.sasPpk ?? '',
       g?.sasPrk ?? '',
       g?.kehadiran ?? '',
@@ -474,54 +571,70 @@ export function exportSubjectGradeExcel(
       g?.p3Scores[3] ?? 85,
       g?.p3Scores[4] ?? 85,
       g?.p3Scores[5] ?? 85,
-      g?.deskripsiManual || g?.deskripsiAuto || '',
+      safeExcelCell(g?.deskripsiManual || g?.deskripsiAuto || ''),
     ]);
   });
 
   const stats = computeColumnStats(raporVals, subject.kktp);
+  const akhirCol = sasCol + 6;
+  const makeStatRow = (
+    firstLabel: string | number,
+    secondLabel: string,
+    thirdVal: string,
+    statKey: string,
+    statVal: number
+  ): (string | number)[] => {
+    const r: (string | number)[] = Array(akhirCol + 1).fill('');
+    r[0] = firstLabel;
+    r[1] = secondLabel;
+    r[2] = thirdVal;
+    r[3] = statKey;
+    r[akhirCol] = statVal;
+    return r;
+  };
+
+  const signDateCol = Math.min(10, akhirCol);
+  const signRow1: (string | number)[] = Array(signDateCol + 1).fill('');
+  signRow1[2] = 'Mengetahui :';
+  signRow1[signDateCol] = safeExcelCell(`${settings.reportCity}, ${settings.reportDate}`);
+  const signRow2: (string | number)[] = Array(signDateCol + 1).fill('');
+  signRow2[2] = 'Kepala Sekolah,';
+  signRow2[signDateCol] = 'Guru Mata Pelajaran,';
+  const signRow3: (string | number)[] = Array(signDateCol + 1).fill('');
+  signRow3[2] = safeExcelCell(settings.principalName);
+  signRow3[signDateCol] = safeExcelCell(subject.teacherName || '-');
+  const signRow4: (string | number)[] = Array(signDateCol + 1).fill('');
+  signRow4[2] = safeExcelCell(`NIP/NUPTK : ${settings.principalNip}`);
+  signRow4[signDateCol] = safeExcelCell(`NRKS/NIP : ${subject.teacherNip || '-'}`);
+
   aoa.push([]);
-  aoa.push(['REKAPITULASI', 'Peserta', `${students.length} orang`, 'JML :', '', '', '', '', '', '', '', '', '', '', '', '', '', '', stats.jml]);
-  aoa.push(['', 'Tercapai', `${stats.tercapai} orang`, 'MIN :', '', '', '', '', '', '', '', '', '', '', '', '', '', '', stats.min]);
-  aoa.push(['', 'B. Tercapai', `${stats.belumTercapai} orang`, 'MAX :', '', '', '', '', '', '', '', '', '', '', '', '', '', '', stats.max]);
-  aoa.push(['', 'Rata-rata', '', 'RT :', '', '', '', '', '', '', '', '', '', '', '', '', '', '', Number(stats.avg.toFixed(2))]);
-  aoa.push(['', 'Simp. Baku', '', 'SB :', '', '', '', '', '', '', '', '', '', '', '', '', '', '', Number(stats.stdDev.toFixed(2))]);
+  aoa.push(makeStatRow('REKAPITULASI', 'Peserta', `${students.length} orang`, 'JML :', stats.jml));
+  aoa.push(makeStatRow('', 'Tercapai', `${stats.tercapai} orang`, 'MIN :', stats.min));
+  aoa.push(makeStatRow('', 'B. Tercapai', `${stats.belumTercapai} orang`, 'MAX :', stats.max));
+  aoa.push(makeStatRow('', 'Rata-rata', '', 'RT :', Number(stats.avg.toFixed(2))));
+  aoa.push(makeStatRow('', 'Simp. Baku', '', 'SB :', Number(stats.stdDev.toFixed(2))));
   aoa.push([]);
-  aoa.push(['', '', 'Mengetahui :', '', '', '', '', '', '', '', `${settings.reportCity}, ${settings.reportDate}`]);
-  aoa.push(['', '', 'Kepala Sekolah,', '', '', '', '', '', '', '', 'Guru Mata Pelajaran,']);
+  aoa.push(signRow1);
+  aoa.push(signRow2);
   aoa.push([]);
   aoa.push([]);
-  aoa.push(['', '', settings.principalName, '', '', '', '', '', '', '', subject.teacherName || '-']);
-  aoa.push(['', '', `NIP/NUPTK : ${settings.principalNip}`, '', '', '', '', '', '', '', `NRKS/NIP : ${subject.teacherNip || '-'}`]);
+  aoa.push(signRow3);
+  aoa.push(signRow4);
 
   const ws = XLSX.utils.aoa_to_sheet(aoa);
-  ws['!cols'] = [
+  ws['!merges'] = merges;
+
+  const cols: XLSX.ColInfo[] = [
     { wch: 6 },
     { wch: 13 },
     { wch: 28 },
     { wch: 5 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 6 },
-    { wch: 10 },
-    { wch: 8 },
-    { wch: 8 },
-    { wch: 9 },
-    { wch: 8 },
-    { wch: 5 },
-    { wch: 5 },
-    { wch: 5 },
-    { wch: 5 },
-    { wch: 5 },
-    { wch: 5 },
-    { wch: 65 },
   ];
+  for (let c = 4; c < sasCol + 2; c++) cols.push({ wch: 6 });
+  cols.push({ wch: 10 }, { wch: 8 }, { wch: 8 }, { wch: 9 }, { wch: 8 });
+  for (let d = 0; d < 6; d++) cols.push({ wch: 5 });
+  cols.push({ wch: 65 });
+  ws['!cols'] = cols;
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Daftar Nilai');
@@ -546,7 +659,7 @@ export function exportClassLegerExcel(
     'NISN',
     'Nama Peserta Didik',
     'L/P',
-    ...subjects.map((s) => s.name),
+    ...subjects.map((s) => safeExcelCell(s.name)),
     'Jumlah',
     'Rata-rata',
     'Sakit',
@@ -558,20 +671,29 @@ export function exportClassLegerExcel(
   const rows = students.map((student, idx) => {
     const scores = subjects.map((sub) => {
       const found = grades.find(
-        (g) => g.studentId === student.id && g.subjectId === sub.id
+        (g) =>
+          g.studentId === student.id &&
+          g.subjectId === sub.id &&
+          g.academicYear === settings.academicYear &&
+          g.semester === settings.semester
       );
       return found ? recalculateSubjectGrade(found, sub, settings).nilaiAkhir : 0;
     });
     const validScores = scores.filter((s) => s > 0);
     const total = validScores.reduce((a, b) => a + b, 0);
     const avg = validScores.length > 0 ? Number((total / validScores.length).toFixed(2)) : 0;
-    const hr = homeroomRecords.find((h) => h.studentId === student.id);
+    const hr = homeroomRecords.find(
+      (h) =>
+        h.studentId === student.id &&
+        h.academicYear === settings.academicYear &&
+        h.semester === settings.semester
+    );
 
     return [
       idx + 1,
-      student.nis,
-      student.nisn,
-      student.fullName,
+      safeExcelCell(student.nis),
+      safeExcelCell(student.nisn),
+      safeExcelCell(student.fullName),
       student.gender,
       ...scores,
       total,
@@ -579,15 +701,15 @@ export function exportClassLegerExcel(
       hr?.sakit ?? 0,
       hr?.izin ?? 0,
       hr?.alpha ?? 0,
-      hr?.waliNote ?? '',
+      safeExcelCell(hr?.waliNote ?? ''),
     ];
   });
 
   const aoa = [
-    [settings.yayasan],
-    [settings.schoolName],
-    [`LEGER NILAI RAPORT KURIKULUM MERDEKA — KELAS ${classRoom.name} (FASE ${classRoom.fase})`],
-    [`Tahun Ajaran ${settings.academicYear} · Semester ${settings.semester}`],
+    [safeExcelCell(settings.yayasan)],
+    [safeExcelCell(settings.schoolName)],
+    [safeExcelCell(`LEGER NILAI RAPORT KURIKULUM MERDEKA — KELAS ${classRoom.name} (FASE ${classRoom.fase})`)],
+    [safeExcelCell(`Tahun Ajaran ${settings.academicYear} · Semester ${settings.semester}`)],
     [],
     headers,
     ...rows,
@@ -664,7 +786,7 @@ export function downloadGradeTemplateExcel(
   subject.tpList.forEach((tp, idx) => {
     const startCol = 4 + idx * 2;
     sumatifHeaderRow.push(`Sumatif ${idx + 1}`, '');
-    tpTitleRow.push(tp.title, '');
+    tpTitleRow.push(safeExcelCell(tp.title), '');
     ppkPrkRow.push('PPK', 'PRK');
     merges.push({ s: { r: 9, c: startCol }, e: { r: 9, c: startCol + 1 } });
     merges.push({ s: { r: 10, c: startCol }, e: { r: 10, c: startCol + 1 } });
@@ -696,7 +818,7 @@ export function downloadGradeTemplateExcel(
     'Deskripsi Capaian Kompetensi'
   );
   tpTitleRow.push(
-    subject.sasTitle || 'Sumatif Akhir Semester',
+    safeExcelCell(subject.sasTitle || 'Sumatif Akhir Semester'),
     '',
     '',
     '',
@@ -724,12 +846,12 @@ export function downloadGradeTemplateExcel(
   const kkmCol = p3Col + 5;
 
   const kelasRow: (string | number)[] = Array(descCol + 1).fill('');
-  kelasRow[0] = `Kelas              :  ${classRoom.name}`;
+  kelasRow[0] = safeExcelCell(`Kelas              :  ${classRoom.name}`);
   kelasRow[kkmCol] = subject.kktp;
 
   const mapelRow: (string | number)[] = Array(descCol + 1).fill('');
   mapelRow[0] = 'Mata Pelajaran:';
-  mapelRow[2] = subject.name;
+  mapelRow[2] = safeExcelCell(subject.name);
   mapelRow[kkmCol] = 'KKM';
 
   const headerDaftarRow: (string | number)[] = Array(descCol + 1).fill('');
@@ -737,9 +859,9 @@ export function downloadGradeTemplateExcel(
   headerDaftarRow[kkmCol] = '>> TEMPLATE RESMI UPLOAD E-RAPORT <<';
 
   const aoa: (string | number)[][] = [
-    ['', '', settings.yayasan],
-    ['', '', settings.schoolName],
-    ['', '', settings.address],
+    ['', '', safeExcelCell(settings.yayasan)],
+    ['', '', safeExcelCell(settings.schoolName)],
+    ['', '', safeExcelCell(settings.address)],
     [],
     headerDaftarRow,
     mapelRow,
@@ -774,8 +896,8 @@ export function downloadGradeTemplateExcel(
   studentRows.forEach((student, idx) => {
     const row: (string | number)[] = Array(descCol + 1).fill('');
     row[0] = idx + 1;
-    row[1] = student.nis;
-    row[2] = student.fullName;
+    row[1] = safeExcelCell(student.nis);
+    row[2] = safeExcelCell(student.fullName);
     row[3] = student.gender;
     // Pre-fill default Sikap P3 = 85 and Kehadiran = 90 as convenient starting defaults, leave scores blank for teacher input
     row[kehCol] = '';
@@ -868,8 +990,8 @@ export function downloadSimpleGradeTemplateExcel(
 
   const rows = studentRows.map((stu, idx) => [
     idx + 1,
-    stu.nis,
-    stu.fullName,
+    safeExcelCell(stu.nis),
+    safeExcelCell(stu.fullName),
     stu.gender,
     ...Array(subject.tpList.length * 2).fill(''),
     '',
@@ -886,8 +1008,8 @@ export function downloadSimpleGradeTemplateExcel(
   ]);
 
   const aoa: (string | number)[][] = [
-    ['Mata Pelajaran', subject.name, 'KKTP', subject.kktp],
-    ['Kelas', classRoom.name, 'Tahun Ajaran', `${settings.academicYear} (${settings.semester})`],
+    ['Mata Pelajaran', safeExcelCell(subject.name), 'KKTP', subject.kktp],
+    ['Kelas', safeExcelCell(classRoom.name), 'Tahun Ajaran', safeExcelCell(`${settings.academicYear} (${settings.semester})`)],
     [],
     headers,
     ...rows,

@@ -58,7 +58,11 @@ export function DashboardView() {
       const subGrades = classStudents
         .map((stu) => {
           const found = grades.find(
-            (g) => g.studentId === stu.id && g.subjectId === sub.id
+            (g) =>
+              g.studentId === stu.id &&
+              g.subjectId === sub.id &&
+              g.academicYear === settings.academicYear &&
+              g.semester === settings.semester
           );
           return found ? recalculateSubjectGrade(found, sub, settings) : null;
         })

@@ -55,7 +55,7 @@ export function ReportCardView() {
 
   const homeroomTeacher = selectedClass
     ? users.find((u) => u.id === selectedClass.homeroomTeacherId) ||
-      users.find((u) => u.role === 'wali_kelas')
+      users.find((u) => u.role === 'wali_kelas' && u.assignedClassId === selectedClass.id)
     : undefined;
 
   const activeStudent =
@@ -82,14 +82,23 @@ export function ReportCardView() {
     student: Student,
     options?: { inModal?: boolean; showMarginGuide?: boolean }
   ) => {
-    const hr = homeroomRecords.find((h) => h.studentId === student.id);
+    const hr = homeroomRecords.find(
+      (h) =>
+        h.studentId === student.id &&
+        h.academicYear === settings.academicYear &&
+        h.semester === settings.semester
+    );
 
     const buildRows = (group: 'Umum' | 'Pilihan' | 'Muatan Lokal') =>
       classSubjects
         .filter((sub) => getRaportSubjectGroup(sub, selectedClass) === group)
         .map((sub) => {
           const found = grades.find(
-            (g) => g.studentId === student.id && g.subjectId === sub.id
+            (g) =>
+              g.studentId === student.id &&
+              g.subjectId === sub.id &&
+              g.academicYear === settings.academicYear &&
+              g.semester === settings.semester
           );
           const computed = found
             ? recalculateSubjectGrade(found, sub, settings)
@@ -174,7 +183,7 @@ export function ReportCardView() {
                 <td className="py-0.5 text-slate-600 align-top">Alamat Sekolah</td>
                 <td className="py-0.5 align-top">:</td>
                 <td className="py-0.5 text-[11px] leading-snug">
-                  Jl. Babakan Ciparay Gg. Atakiria I No. 28 Bandung
+                  {settings.address}
                 </td>
               </tr>
             </tbody>

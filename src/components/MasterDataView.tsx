@@ -40,14 +40,37 @@ import { DEFAULT_SCHOOL_LOGO, SchoolCrest } from './SchoolCrest';
 
 type MasterTab = 'siswa' | 'kelas_mapel' | 'akun_role' | 'bobot_sekolah' | 'supabase_setup';
 
-const SQL_SNIPPET = `-- Jalankan di Supabase SQL Editor (Project -> SQL Editor -> New Query)
--- Aman dijalankan ulang (idempotent) & sinkron dengan /supabase/schema.sql
+const SQL_SNIPPET = `-- ============================================================================
+-- SKEMA DATABASE SUPABASE (POSTGRESQL) - IDEMPOTENT & AMAN DIJALANKAN ULANG
+-- Sistem Informasi Pengolahan Nilai Raport Kurikulum Merdeka
+-- SMA PASUNDAN 9 BANDUNG
+-- ============================================================================
 
-DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; EXCEPTION WHEN OTHERS THEN null; END $$;
-DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA extensions; EXCEPTION WHEN OTHERS THEN null; END $$;
-DO $$ BEGIN CREATE TYPE public.user_role AS ENUM ('admin', 'guru', 'wali_kelas'); EXCEPTION WHEN duplicate_object THEN null; END $$;
-DO $$ BEGIN CREATE TYPE public.gender_type AS ENUM ('L', 'P'); EXCEPTION WHEN duplicate_object THEN null; END $$;
+-- 1. EKSTENSI UUID & KRIPTOGRAFI
+DO $$ BEGIN
+  CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+EXCEPTION WHEN OTHERS THEN null;
+END $$;
 
+DO $$ BEGIN
+  CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA extensions;
+EXCEPTION WHEN OTHERS THEN null;
+END $$;
+
+-- 2. ENUM TIPE ROLE & JENIS KELAMIN
+DO $$ BEGIN
+  CREATE TYPE public.user_role AS ENUM ('admin', 'guru', 'wali_kelas');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+  CREATE TYPE public.gender_type AS ENUM ('L', 'P');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
+
+-- 3. TABEL PROFIL PENGGUNA (Terhubung ke Supabase Auth auth.users)
 CREATE TABLE IF NOT EXISTS public.profiles (
   id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   email TEXT UNIQUE NOT NULL,
@@ -56,10 +79,19 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   nrks TEXT DEFAULT '',
   role public.user_role NOT NULL DEFAULT 'guru',
   avatar_url TEXT,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  assigned_class_id UUID,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.profiles
+  ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS assigned_class_id UUID,
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- 4. TABEL PENGATURAN SEKOLAH & BOBOT PENILAIAN
 CREATE TABLE IF NOT EXISTS public.school_settings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   yayasan TEXT NOT NULL DEFAULT 'YAYASAN PENDIDIKAN DASAR DAN MENENGAH PASUNDAN',
@@ -86,6 +118,11 @@ CREATE TABLE IF NOT EXISTS public.school_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.school_settings
+  ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- 5. TABEL KELAS (Fase E = Kelas X, Fase F = Kelas XI & XII)
 CREATE TABLE IF NOT EXISTS public.classes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL UNIQUE,
@@ -96,6 +133,18 @@ CREATE TABLE IF NOT EXISTS public.classes (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.classes
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+DO $$ BEGIN
+  ALTER TABLE public.profiles
+    ADD CONSTRAINT profiles_assigned_class_id_fkey
+    FOREIGN KEY (assigned_class_id) REFERENCES public.classes(id) ON DELETE SET NULL;
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
+
+-- 6. TABEL MATA PELAJARAN
 CREATE TABLE IF NOT EXISTS public.subjects (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   code TEXT NOT NULL,
@@ -109,6 +158,12 @@ CREATE TABLE IF NOT EXISTS public.subjects (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.subjects
+  ADD COLUMN IF NOT EXISTS fase_scope TEXT NOT NULL DEFAULT 'ALL',
+  ADD COLUMN IF NOT EXISTS class_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- 7. TABEL TUJUAN PEMBELAJARAN (TP / Lingkup Materi)
 CREATE TABLE IF NOT EXISTS public.learning_objectives (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   subject_id UUID NOT NULL REFERENCES public.subjects(id) ON DELETE CASCADE,
@@ -119,6 +174,10 @@ CREATE TABLE IF NOT EXISTS public.learning_objectives (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.learning_objectives
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- 8. TABEL SISWA
 CREATE TABLE IF NOT EXISTS public.students (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   nis TEXT UNIQUE NOT NULL,
@@ -136,6 +195,10 @@ CREATE TABLE IF NOT EXISTS public.students (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.students
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- 9. TABEL NILAI MATA PELAJARAN PER SISWA
 CREATE TABLE IF NOT EXISTS public.student_grades (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE CASCADE,
@@ -158,6 +221,10 @@ CREATE TABLE IF NOT EXISTS public.student_grades (
   UNIQUE(student_id, subject_id, academic_year, semester)
 );
 
+ALTER TABLE public.student_grades
+  ADD COLUMN IF NOT EXISTS updated_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL;
+
+-- 10. TABEL CATATAN WALI KELAS, ABSENSI, EKSKUL & P5
 CREATE TABLE IF NOT EXISTS public.homeroom_records (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE CASCADE,
@@ -175,6 +242,10 @@ CREATE TABLE IF NOT EXISTS public.homeroom_records (
   UNIQUE(student_id, academic_year, semester)
 );
 
+ALTER TABLE public.homeroom_records
+  ADD COLUMN IF NOT EXISTS updated_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL;
+
+-- 11. TABEL STATUS KUNCI & PENGIRIMAN NILAI GURU KE WALI KELAS
 CREATE TABLE IF NOT EXISTS public.grade_submissions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE CASCADE,
@@ -184,13 +255,20 @@ CREATE TABLE IF NOT EXISTS public.grade_submissions (
   status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'locked', 'sent')),
   locked_at TIMESTAMPTZ,
   locked_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  locked_by_name TEXT DEFAULT '',
   sent_at TIMESTAMPTZ,
   sent_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  sent_by_name TEXT DEFAULT '',
   note TEXT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(class_id, subject_id, academic_year, semester)
 );
 
+ALTER TABLE public.grade_submissions
+  ADD COLUMN IF NOT EXISTS locked_by_name TEXT DEFAULT '',
+  ADD COLUMN IF NOT EXISTS sent_by_name TEXT DEFAULT '';
+
+-- 12. TABEL NOTIFIKASI REALTIME NILAI BARU UNTUK WALI KELAS
 CREATE TABLE IF NOT EXISTS public.grade_notifications (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL DEFAULT 'single_grade',
@@ -211,10 +289,18 @@ CREATE TABLE IF NOT EXISTS public.grade_notifications (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-GRANT USAGE ON SCHEMA public TO anon, authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
-GRANT SELECT, INSERT ON public.grade_notifications TO anon, authenticated;
+-- ============================================================================
+-- INDEKS PERFORMA
+-- ============================================================================
+CREATE INDEX IF NOT EXISTS idx_profiles_assigned_class ON public.profiles(assigned_class_id);
+CREATE INDEX IF NOT EXISTS idx_students_class ON public.students(class_id);
+CREATE INDEX IF NOT EXISTS idx_grades_student_subject ON public.student_grades(student_id, subject_id);
+CREATE INDEX IF NOT EXISTS idx_lo_subject ON public.learning_objectives(subject_id);
+CREATE INDEX IF NOT EXISTS idx_grade_notifications_created_at ON public.grade_notifications(created_at DESC);
 
+-- ============================================================================
+-- ROW LEVEL SECURITY (RLS) & KEBIJAKAN HAK AKSES (IDEMPOTENT)
+-- ============================================================================
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.school_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.classes ENABLE ROW LEVEL SECURITY;
@@ -226,15 +312,30 @@ ALTER TABLE public.homeroom_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.grade_submissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.grade_notifications ENABLE ROW LEVEL SECURITY;
 
+GRANT USAGE ON SCHEMA public TO authenticated;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
+
+-- Helper function cek role user AKTIF (user nonaktif otomatis ditolak RLS)
 CREATE OR REPLACE FUNCTION public.get_my_role()
 RETURNS public.user_role
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
-AS $$ SELECT role FROM public.profiles WHERE id = auth.uid(); $$;
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT role FROM public.profiles WHERE id = auth.uid() AND is_active = TRUE;
+$$;
 
+-- Trigger auto-confirm email & bootstrap Admin pertama kali (akun lain hanya dibuat lewat Admin)
 CREATE OR REPLACE FUNCTION public.handle_new_user()
-RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
 AS $$
 BEGIN
+  -- Aktifkan akun langsung tanpa perlu verifikasi email
   BEGIN
     UPDATE auth.users
     SET email_confirmed_at = COALESCE(email_confirmed_at, NOW())
@@ -242,15 +343,19 @@ BEGIN
   EXCEPTION WHEN OTHERS THEN null;
   END;
 
+  -- Hanya auto-buat profil saat inisialisasi Admin pertama;
+  -- akun Guru / Wali / Admin berikutnya hanya boleh didaftarkan oleh Admin via RPC admin_create_user.
   IF NOT EXISTS (SELECT 1 FROM public.profiles WHERE role = 'admin') THEN
-    INSERT INTO public.profiles (id, email, full_name, nip_nuptk, role)
+    INSERT INTO public.profiles (id, email, full_name, nip_nuptk, role, is_active)
     VALUES (
       NEW.id,
       COALESCE(NEW.email, ''),
       COALESCE(NULLIF(TRIM(NEW.raw_user_meta_data->>'full_name'), ''), split_part(COALESCE(NEW.email, 'User'), '@', 1)),
       COALESCE(NEW.raw_user_meta_data->>'nip_nuptk', ''),
-      'admin'
-    ) ON CONFLICT (id) DO NOTHING;
+      'admin',
+      TRUE
+    )
+    ON CONFLICT (id) DO NOTHING;
   END IF;
   RETURN NEW;
 END;
@@ -258,16 +363,19 @@ $$;
 
 DO $$ BEGIN
   DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
-  CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+  CREATE TRIGGER on_auth_user_created
+    AFTER INSERT ON auth.users
+    FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 EXCEPTION WHEN insufficient_privilege OR undefined_table THEN null;
 END $$;
 
+-- Backfill otomatis & konfirmasi akun auth.users yang sudah ada sebelum skrip SQL ini dijalankan
 DO $$ BEGIN
   UPDATE auth.users
   SET email_confirmed_at = COALESCE(email_confirmed_at, NOW())
   WHERE email_confirmed_at IS NULL;
 
-  INSERT INTO public.profiles (id, email, full_name, nip_nuptk, role)
+  INSERT INTO public.profiles (id, email, full_name, nip_nuptk, role, is_active)
   SELECT
     u.id,
     COALESCE(u.email, ''),
@@ -276,12 +384,13 @@ DO $$ BEGIN
     CASE
       WHEN u.raw_user_meta_data->>'role' = 'wali_kelas' THEN 'wali_kelas'::public.user_role
       ELSE 'guru'::public.user_role
-    END
+    END,
+    TRUE
   FROM auth.users u
   ON CONFLICT (id) DO NOTHING;
 
   UPDATE public.profiles
-  SET role = 'admin'
+  SET role = 'admin', is_active = TRUE
   WHERE id = (
     SELECT p.id FROM public.profiles p
     JOIN auth.users u ON u.id = p.id
@@ -293,16 +402,36 @@ DO $$ BEGIN
 EXCEPTION WHEN insufficient_privilege OR undefined_table THEN null;
 END $$;
 
+-- Profiles (Hanya Admin aktif yang dapat mendaftarkan, mengubah role/status, atau menghapus akun pengguna)
 DROP POLICY IF EXISTS "Profiles readable by authenticated" ON public.profiles;
-CREATE POLICY "Profiles readable by authenticated" ON public.profiles FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Profiles readable by authenticated" ON public.profiles
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL OR auth.uid() = id);
+
 DROP POLICY IF EXISTS "Profiles modifiable by admin or self" ON public.profiles;
 DROP POLICY IF EXISTS "Profiles insertable by admin only" ON public.profiles;
 DROP POLICY IF EXISTS "Profiles updatable by admin or self" ON public.profiles;
 DROP POLICY IF EXISTS "Profiles deletable by admin only" ON public.profiles;
-CREATE POLICY "Profiles insertable by admin only" ON public.profiles FOR INSERT TO authenticated WITH CHECK (public.get_my_role() = 'admin');
-CREATE POLICY "Profiles updatable by admin or self" ON public.profiles FOR UPDATE TO authenticated USING (public.get_my_role() = 'admin' OR auth.uid() = id) WITH CHECK (public.get_my_role() = 'admin' OR (auth.uid() = id AND role = public.get_my_role()));
-CREATE POLICY "Profiles deletable by admin only" ON public.profiles FOR DELETE TO authenticated USING (public.get_my_role() = 'admin');
 
+CREATE POLICY "Profiles insertable by admin only" ON public.profiles
+  FOR INSERT TO authenticated
+  WITH CHECK (public.get_my_role() = 'admin');
+
+CREATE POLICY "Profiles updatable by admin or self" ON public.profiles
+  FOR UPDATE TO authenticated
+  USING (public.get_my_role() = 'admin' OR (auth.uid() = id AND is_active = TRUE))
+  WITH CHECK (
+    public.get_my_role() = 'admin'
+    OR (auth.uid() = id AND role = public.get_my_role() AND is_active = TRUE)
+  );
+
+CREATE POLICY "Profiles deletable by admin only" ON public.profiles
+  FOR DELETE TO authenticated
+  USING (public.get_my_role() = 'admin');
+
+-- ============================================================================
+-- FUNGSI RPC KHUSUS ADMIN: CREATE, UPDATE & DELETE USER (LANGSUNG AKTIF)
+-- ============================================================================
+-- Tetap bekerja meskipun "Allow new users to sign up" / Email signups dimatikan di Supabase Dashboard
 CREATE OR REPLACE FUNCTION public.admin_create_user(
   p_email TEXT,
   p_password TEXT,
@@ -323,47 +452,126 @@ DECLARE
   v_nip TEXT := trim(COALESCE(p_nip_nuptk, ''));
   v_nrks TEXT := trim(COALESCE(p_nrks, ''));
   v_role public.user_role;
+  v_class_raw TEXT := trim(COALESCE(p_assigned_class_id, ''));
+  v_class_id UUID := NULL;
   v_user_id UUID;
 BEGIN
   IF auth.uid() IS NULL OR public.get_my_role() IS DISTINCT FROM 'admin' THEN
     RAISE EXCEPTION 'Hanya Admin Sekolah yang dapat mendaftarkan akun baru.';
   END IF;
-  IF v_email !~* '^[^\s@]+@[^\s@]+\.[^\s@]+$' THEN RAISE EXCEPTION 'Format email tidak valid.'; END IF;
-  IF length(v_name) < 2 THEN RAISE EXCEPTION 'Nama lengkap minimal 2 karakter.'; END IF;
-  IF length(COALESCE(p_password, '')) < 6 THEN RAISE EXCEPTION 'Kata sandi minimal 6 karakter.'; END IF;
-  IF p_role NOT IN ('admin', 'guru', 'wali_kelas') THEN RAISE EXCEPTION 'Role harus admin, guru, atau wali_kelas.'; END IF;
+
+  IF v_email !~* '^[^\s@]+@[^\s@]+\.[^\s@]+$' THEN
+    RAISE EXCEPTION 'Format email tidak valid.';
+  END IF;
+
+  IF length(v_name) < 2 THEN
+    RAISE EXCEPTION 'Nama lengkap minimal 2 karakter.';
+  END IF;
+
+  IF length(COALESCE(p_password, '')) < 6 THEN
+    RAISE EXCEPTION 'Kata sandi minimal 6 karakter.';
+  END IF;
+
+  IF p_role NOT IN ('admin', 'guru', 'wali_kelas') THEN
+    RAISE EXCEPTION 'Role harus admin, guru, atau wali_kelas.';
+  END IF;
   v_role := p_role::public.user_role;
+
+  IF v_role = 'wali_kelas'
+     AND v_class_raw ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' THEN
+    SELECT id INTO v_class_id FROM public.classes WHERE id = v_class_raw::uuid;
+  END IF;
+
   IF EXISTS (SELECT 1 FROM auth.users WHERE lower(email) = v_email) THEN
     RAISE EXCEPTION 'Email tersebut sudah terdaftar di Supabase Authentication.';
   END IF;
 
   v_user_id := gen_random_uuid();
+
   INSERT INTO auth.users (
-    instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
-    raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
-    confirmation_token, email_change, email_change_token_new, recovery_token
-  ) VALUES (
-    '00000000-0000-0000-0000-000000000000', v_user_id, 'authenticated', 'authenticated',
-    v_email, crypt(p_password, gen_salt('bf')), NOW(),
+    instance_id,
+    id,
+    aud,
+    role,
+    email,
+    encrypted_password,
+    email_confirmed_at,
+    raw_app_meta_data,
+    raw_user_meta_data,
+    created_at,
+    updated_at,
+    confirmation_token,
+    email_change,
+    email_change_token_new,
+    recovery_token
+  )
+  VALUES (
+    '00000000-0000-0000-0000-000000000000',
+    v_user_id,
+    'authenticated',
+    'authenticated',
+    v_email,
+    extensions.crypt(p_password, extensions.gen_salt('bf')),
+    NOW(),
     '{"provider":"email","providers":["email"]}'::jsonb,
-    jsonb_build_object('full_name', v_name, 'nip_nuptk', v_nip, 'role', p_role, 'assigned_class_id', NULLIF(trim(COALESCE(p_assigned_class_id, '')), '')),
-    NOW(), NOW(), '', '', '', ''
+    jsonb_build_object(
+      'full_name', v_name,
+      'nip_nuptk', v_nip,
+      'role', p_role,
+      'assigned_class_id', v_class_id::text
+    ),
+    NOW(),
+    NOW(),
+    '',
+    '',
+    '',
+    ''
   );
 
   INSERT INTO auth.identities (
-    id, user_id, identity_data, provider, provider_id, last_sign_in_at, created_at, updated_at
-  ) VALUES (
-    gen_random_uuid(), v_user_id,
-    jsonb_build_object('sub', v_user_id::text, 'email', v_email, 'email_verified', true, 'phone_verified', false),
-    'email', v_user_id::text, NOW(), NOW(), NOW()
-  ) ON CONFLICT DO NOTHING;
+    id,
+    user_id,
+    identity_data,
+    provider,
+    provider_id,
+    last_sign_in_at,
+    created_at,
+    updated_at
+  )
+  VALUES (
+    gen_random_uuid(),
+    v_user_id,
+    jsonb_build_object(
+      'sub', v_user_id::text,
+      'email', v_email,
+      'email_verified', true,
+      'phone_verified', false
+    ),
+    'email',
+    v_user_id::text,
+    NOW(),
+    NOW(),
+    NOW()
+  )
+  ON CONFLICT DO NOTHING;
 
-  INSERT INTO public.profiles (id, email, full_name, nip_nuptk, nrks, role)
-  VALUES (v_user_id, v_email, v_name, v_nip, v_nrks, v_role)
+  INSERT INTO public.profiles (id, email, full_name, nip_nuptk, nrks, role, is_active, assigned_class_id)
+  VALUES (v_user_id, v_email, v_name, v_nip, v_nrks, v_role, TRUE, v_class_id)
   ON CONFLICT (id) DO UPDATE SET
-    email = EXCLUDED.email, full_name = EXCLUDED.full_name,
-    nip_nuptk = EXCLUDED.nip_nuptk, nrks = EXCLUDED.nrks,
-    role = EXCLUDED.role, updated_at = NOW();
+    email = EXCLUDED.email,
+    full_name = EXCLUDED.full_name,
+    nip_nuptk = EXCLUDED.nip_nuptk,
+    nrks = EXCLUDED.nrks,
+    role = EXCLUDED.role,
+    is_active = TRUE,
+    assigned_class_id = EXCLUDED.assigned_class_id,
+    updated_at = NOW();
+
+  IF v_role = 'wali_kelas' AND v_class_id IS NOT NULL THEN
+    UPDATE public.classes
+    SET homeroom_teacher_id = v_user_id
+    WHERE id = v_class_id;
+  END IF;
 
   RETURN v_user_id;
 END;
@@ -372,67 +580,426 @@ $$;
 REVOKE ALL ON FUNCTION public.admin_create_user(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.admin_create_user(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) TO authenticated;
 
-DROP POLICY IF EXISTS "Settings readable by authenticated" ON public.school_settings;
-CREATE POLICY "Settings readable by authenticated" ON public.school_settings FOR SELECT TO authenticated USING (true);
-DROP POLICY IF EXISTS "Settings modifiable by admin" ON public.school_settings;
-CREATE POLICY "Settings modifiable by admin" ON public.school_settings FOR ALL TO authenticated USING (public.get_my_role() = 'admin') WITH CHECK (public.get_my_role() = 'admin');
+CREATE OR REPLACE FUNCTION public.admin_update_user(
+  p_user_id UUID,
+  p_full_name TEXT DEFAULT NULL,
+  p_nip_nuptk TEXT DEFAULT NULL,
+  p_nrks TEXT DEFAULT NULL,
+  p_role TEXT DEFAULT NULL,
+  p_is_active BOOLEAN DEFAULT NULL,
+  p_assigned_class_id TEXT DEFAULT NULL,
+  p_clear_assigned_class BOOLEAN DEFAULT FALSE,
+  p_new_password TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, auth, extensions
+AS $$
+DECLARE
+  v_target public.profiles%ROWTYPE;
+  v_next_name TEXT;
+  v_next_nip TEXT;
+  v_next_nrks TEXT;
+  v_next_role public.user_role;
+  v_next_active BOOLEAN;
+  v_class_raw TEXT := trim(COALESCE(p_assigned_class_id, ''));
+  v_next_class_id UUID;
+  v_other_active_admins INTEGER;
+BEGIN
+  IF auth.uid() IS NULL OR public.get_my_role() IS DISTINCT FROM 'admin' THEN
+    RAISE EXCEPTION 'Hanya Admin Sekolah yang dapat memperbarui akun pengguna.';
+  END IF;
 
+  SELECT * INTO v_target FROM public.profiles WHERE id = p_user_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Akun pengguna tidak ditemukan di Supabase.';
+  END IF;
+
+  IF p_role IS NOT NULL AND p_role NOT IN ('admin', 'guru', 'wali_kelas') THEN
+    RAISE EXCEPTION 'Role harus admin, guru, atau wali_kelas.';
+  END IF;
+
+  v_next_name := CASE WHEN p_full_name IS NOT NULL AND length(trim(p_full_name)) >= 2 THEN trim(p_full_name) ELSE v_target.full_name END;
+  v_next_nip := CASE WHEN p_nip_nuptk IS NOT NULL THEN trim(p_nip_nuptk) ELSE COALESCE(v_target.nip_nuptk, '') END;
+  v_next_nrks := CASE WHEN p_nrks IS NOT NULL THEN trim(p_nrks) ELSE COALESCE(v_target.nrks, '') END;
+  v_next_role := CASE WHEN p_role IS NOT NULL THEN p_role::public.user_role ELSE v_target.role END;
+  v_next_active := CASE WHEN p_is_active IS NOT NULL THEN p_is_active ELSE v_target.is_active END;
+
+  IF p_user_id = auth.uid() AND (v_next_role <> 'admin' OR v_next_active = FALSE) THEN
+    RAISE EXCEPTION 'Anda tidak dapat menurunkan role atau menonaktifkan akun Anda sendiri.';
+  END IF;
+
+  SELECT COUNT(*) INTO v_other_active_admins
+  FROM public.profiles
+  WHERE role = 'admin' AND is_active = TRUE AND id <> p_user_id;
+
+  IF v_other_active_admins = 0 AND (v_next_role <> 'admin' OR v_next_active = FALSE) THEN
+    RAISE EXCEPTION 'Sistem harus menyisakan minimal 1 akun Admin yang aktif.';
+  END IF;
+
+  IF v_next_role <> 'wali_kelas' OR p_clear_assigned_class THEN
+    v_next_class_id := NULL;
+  ELSIF p_assigned_class_id IS NOT NULL THEN
+    IF v_class_raw ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' THEN
+      SELECT id INTO v_next_class_id FROM public.classes WHERE id = v_class_raw::uuid;
+    ELSE
+      v_next_class_id := NULL;
+    END IF;
+  ELSE
+    v_next_class_id := v_target.assigned_class_id;
+  END IF;
+
+  IF p_new_password IS NOT NULL AND length(p_new_password) > 0 THEN
+    IF length(p_new_password) < 6 THEN
+      RAISE EXCEPTION 'Kata sandi baru minimal 6 karakter.';
+    END IF;
+    UPDATE auth.users
+    SET encrypted_password = extensions.crypt(p_new_password, extensions.gen_salt('bf')),
+        email_confirmed_at = COALESCE(email_confirmed_at, NOW()),
+        updated_at = NOW()
+    WHERE id = p_user_id;
+  END IF;
+
+  UPDATE auth.users
+  SET banned_until = CASE WHEN v_next_active THEN NULL ELSE '2099-12-31T23:59:59Z'::timestamptz END,
+      raw_user_meta_data = COALESCE(raw_user_meta_data, '{}'::jsonb) || jsonb_build_object(
+        'full_name', v_next_name,
+        'nip_nuptk', v_next_nip,
+        'role', v_next_role::text,
+        'assigned_class_id', v_next_class_id::text
+      ),
+      updated_at = NOW()
+  WHERE id = p_user_id;
+
+  UPDATE public.profiles
+  SET full_name = v_next_name,
+      nip_nuptk = v_next_nip,
+      nrks = v_next_nrks,
+      role = v_next_role,
+      is_active = v_next_active,
+      assigned_class_id = v_next_class_id,
+      updated_at = NOW()
+  WHERE id = p_user_id;
+
+  IF v_next_role = 'wali_kelas' AND v_next_class_id IS NOT NULL THEN
+    UPDATE public.classes
+    SET homeroom_teacher_id = NULL
+    WHERE homeroom_teacher_id = p_user_id AND id <> v_next_class_id;
+
+    UPDATE public.classes
+    SET homeroom_teacher_id = p_user_id
+    WHERE id = v_next_class_id;
+  ELSE
+    UPDATE public.classes
+    SET homeroom_teacher_id = NULL
+    WHERE homeroom_teacher_id = p_user_id;
+  END IF;
+
+  RETURN TRUE;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.admin_update_user(UUID, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT, BOOLEAN, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.admin_update_user(UUID, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT, BOOLEAN, TEXT) TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.admin_delete_user(
+  p_user_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, auth
+AS $$
+DECLARE
+  v_other_active_admins INTEGER;
+BEGIN
+  IF auth.uid() IS NULL OR public.get_my_role() IS DISTINCT FROM 'admin' THEN
+    RAISE EXCEPTION 'Hanya Admin Sekolah yang dapat menghapus akun pengguna.';
+  END IF;
+
+  IF p_user_id = auth.uid() THEN
+    RAISE EXCEPTION 'Tidak dapat menghapus akun yang sedang digunakan.';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM public.profiles WHERE id = p_user_id)
+     AND NOT EXISTS (SELECT 1 FROM auth.users WHERE id = p_user_id) THEN
+    RAISE EXCEPTION 'Akun pengguna tidak ditemukan.';
+  END IF;
+
+  SELECT COUNT(*) INTO v_other_active_admins
+  FROM public.profiles
+  WHERE role = 'admin' AND is_active = TRUE AND id <> p_user_id;
+
+  IF v_other_active_admins = 0 THEN
+    RAISE EXCEPTION 'Sistem harus menyisakan minimal 1 akun Admin yang aktif.';
+  END IF;
+
+  DELETE FROM auth.users WHERE id = p_user_id;
+  DELETE FROM public.profiles WHERE id = p_user_id;
+  RETURN TRUE;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.admin_delete_user(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.admin_delete_user(UUID) TO authenticated;
+
+-- School Settings
+DROP POLICY IF EXISTS "Settings readable by authenticated" ON public.school_settings;
+CREATE POLICY "Settings readable by authenticated" ON public.school_settings
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL);
+
+DROP POLICY IF EXISTS "Settings modifiable by admin" ON public.school_settings;
+CREATE POLICY "Settings modifiable by admin" ON public.school_settings
+  FOR ALL TO authenticated
+  USING (public.get_my_role() = 'admin')
+  WITH CHECK (public.get_my_role() = 'admin');
+
+-- Classes, Subjects, Learning Objectives, Students
 DROP POLICY IF EXISTS "Classes readable" ON public.classes;
-CREATE POLICY "Classes readable" ON public.classes FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Classes readable" ON public.classes
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL);
+
 DROP POLICY IF EXISTS "Classes admin write" ON public.classes;
-CREATE POLICY "Classes admin write" ON public.classes FOR ALL TO authenticated USING (public.get_my_role() = 'admin') WITH CHECK (public.get_my_role() = 'admin');
+CREATE POLICY "Classes admin write" ON public.classes
+  FOR ALL TO authenticated
+  USING (public.get_my_role() = 'admin')
+  WITH CHECK (public.get_my_role() = 'admin');
 
 DROP POLICY IF EXISTS "Subjects readable" ON public.subjects;
-CREATE POLICY "Subjects readable" ON public.subjects FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Subjects readable" ON public.subjects
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL);
+
 DROP POLICY IF EXISTS "Subjects admin write" ON public.subjects;
-CREATE POLICY "Subjects admin write" ON public.subjects FOR ALL TO authenticated USING (public.get_my_role() = 'admin') WITH CHECK (public.get_my_role() = 'admin');
+CREATE POLICY "Subjects admin write" ON public.subjects
+  FOR ALL TO authenticated
+  USING (public.get_my_role() = 'admin')
+  WITH CHECK (public.get_my_role() = 'admin');
 
 DROP POLICY IF EXISTS "LO readable" ON public.learning_objectives;
-CREATE POLICY "LO readable" ON public.learning_objectives FOR SELECT TO authenticated USING (true);
+CREATE POLICY "LO readable" ON public.learning_objectives
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL);
+
 DROP POLICY IF EXISTS "LO staff write" ON public.learning_objectives;
-CREATE POLICY "LO staff write" ON public.learning_objectives FOR ALL TO authenticated USING (public.get_my_role() IN ('admin', 'guru', 'wali_kelas')) WITH CHECK (public.get_my_role() IN ('admin', 'guru', 'wali_kelas'));
+CREATE POLICY "LO staff write" ON public.learning_objectives
+  FOR ALL TO authenticated
+  USING (public.get_my_role() IN ('admin', 'guru', 'wali_kelas'))
+  WITH CHECK (public.get_my_role() IN ('admin', 'guru', 'wali_kelas'));
 
 DROP POLICY IF EXISTS "Students readable" ON public.students;
-CREATE POLICY "Students readable" ON public.students FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Students readable" ON public.students
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL);
+
 DROP POLICY IF EXISTS "Students admin write" ON public.students;
-CREATE POLICY "Students admin write" ON public.students FOR ALL TO authenticated USING (public.get_my_role() = 'admin') WITH CHECK (public.get_my_role() = 'admin');
+CREATE POLICY "Students admin write" ON public.students
+  FOR ALL TO authenticated
+  USING (public.get_my_role() = 'admin')
+  WITH CHECK (public.get_my_role() = 'admin');
 
+-- Nilai Akademik
 DROP POLICY IF EXISTS "Grades readable by staff" ON public.student_grades;
-CREATE POLICY "Grades readable by staff" ON public.student_grades FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Grades readable by staff" ON public.student_grades
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL);
+
 DROP POLICY IF EXISTS "Grades writable by staff" ON public.student_grades;
-CREATE POLICY "Grades writable by staff" ON public.student_grades FOR ALL TO authenticated USING (public.get_my_role() IN ('admin', 'guru', 'wali_kelas')) WITH CHECK (public.get_my_role() IN ('admin', 'guru', 'wali_kelas'));
+CREATE POLICY "Grades writable by staff" ON public.student_grades
+  FOR ALL TO authenticated
+  USING (
+    public.get_my_role() = 'admin'
+    OR (
+      public.get_my_role() = 'guru'
+      AND EXISTS (
+        SELECT 1 FROM public.subjects s
+        WHERE s.id = subject_id AND (s.teacher_id = auth.uid() OR s.teacher_id IS NULL)
+      )
+    )
+    OR (
+      public.get_my_role() = 'wali_kelas'
+      AND EXISTS (
+        SELECT 1 FROM public.students st
+        JOIN public.classes c ON c.id = st.class_id
+        WHERE st.id = student_id AND (c.homeroom_teacher_id = auth.uid() OR c.homeroom_teacher_id IS NULL)
+      )
+    )
+  )
+  WITH CHECK (
+    public.get_my_role() = 'admin'
+    OR (
+      public.get_my_role() = 'guru'
+      AND EXISTS (
+        SELECT 1 FROM public.subjects s
+        WHERE s.id = subject_id AND (s.teacher_id = auth.uid() OR s.teacher_id IS NULL)
+      )
+    )
+    OR (
+      public.get_my_role() = 'wali_kelas'
+      AND EXISTS (
+        SELECT 1 FROM public.students st
+        JOIN public.classes c ON c.id = st.class_id
+        WHERE st.id = student_id AND (c.homeroom_teacher_id = auth.uid() OR c.homeroom_teacher_id IS NULL)
+      )
+    )
+  );
 
+-- Homeroom Records
 DROP POLICY IF EXISTS "Homeroom readable by staff" ON public.homeroom_records;
-CREATE POLICY "Homeroom readable by staff" ON public.homeroom_records FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Homeroom readable by staff" ON public.homeroom_records
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL);
+
 DROP POLICY IF EXISTS "Homeroom writable by wali_kelas & admin" ON public.homeroom_records;
-CREATE POLICY "Homeroom writable by wali_kelas & admin" ON public.homeroom_records FOR ALL TO authenticated USING (public.get_my_role() IN ('admin', 'wali_kelas')) WITH CHECK (public.get_my_role() IN ('admin', 'wali_kelas'));
+CREATE POLICY "Homeroom writable by wali_kelas & admin" ON public.homeroom_records
+  FOR ALL TO authenticated
+  USING (
+    public.get_my_role() = 'admin'
+    OR (
+      public.get_my_role() = 'wali_kelas'
+      AND EXISTS (
+        SELECT 1 FROM public.students st
+        JOIN public.classes c ON c.id = st.class_id
+        WHERE st.id = student_id AND (c.homeroom_teacher_id = auth.uid() OR c.homeroom_teacher_id IS NULL)
+      )
+    )
+  )
+  WITH CHECK (
+    public.get_my_role() = 'admin'
+    OR (
+      public.get_my_role() = 'wali_kelas'
+      AND EXISTS (
+        SELECT 1 FROM public.students st
+        JOIN public.classes c ON c.id = st.class_id
+        WHERE st.id = student_id AND (c.homeroom_teacher_id = auth.uid() OR c.homeroom_teacher_id IS NULL)
+      )
+    )
+  );
 
+-- Grade Submissions
 DROP POLICY IF EXISTS "Submissions readable by staff" ON public.grade_submissions;
-CREATE POLICY "Submissions readable by staff" ON public.grade_submissions FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Submissions readable by staff" ON public.grade_submissions
+  FOR SELECT TO authenticated USING (public.get_my_role() IS NOT NULL);
+
 DROP POLICY IF EXISTS "Submissions writable by staff" ON public.grade_submissions;
-CREATE POLICY "Submissions writable by staff" ON public.grade_submissions FOR ALL TO authenticated USING (public.get_my_role() IN ('admin', 'guru', 'wali_kelas')) WITH CHECK (public.get_my_role() IN ('admin', 'guru', 'wali_kelas'));
+CREATE POLICY "Submissions writable by staff" ON public.grade_submissions
+  FOR ALL TO authenticated
+  USING (
+    public.get_my_role() = 'admin'
+    OR (
+      public.get_my_role() = 'guru'
+      AND EXISTS (
+        SELECT 1 FROM public.subjects s
+        WHERE s.id = subject_id AND (s.teacher_id = auth.uid() OR s.teacher_id IS NULL)
+      )
+    )
+    OR (
+      public.get_my_role() = 'wali_kelas'
+      AND EXISTS (
+        SELECT 1 FROM public.classes c
+        WHERE c.id = class_id AND (c.homeroom_teacher_id = auth.uid() OR c.homeroom_teacher_id IS NULL)
+      )
+    )
+  )
+  WITH CHECK (
+    public.get_my_role() = 'admin'
+    OR (
+      public.get_my_role() = 'guru'
+      AND EXISTS (
+        SELECT 1 FROM public.subjects s
+        WHERE s.id = subject_id AND (s.teacher_id = auth.uid() OR s.teacher_id IS NULL)
+      )
+    )
+    OR (
+      public.get_my_role() = 'wali_kelas'
+      AND EXISTS (
+        SELECT 1 FROM public.classes c
+        WHERE c.id = class_id AND (c.homeroom_teacher_id = auth.uid() OR c.homeroom_teacher_id IS NULL)
+      )
+    )
+  );
 
+-- Grade Notifications (khusus pengguna terautentikasi aktif)
 DROP POLICY IF EXISTS "Grade notifications readable by staff" ON public.grade_notifications;
-CREATE POLICY "Grade notifications readable by staff" ON public.grade_notifications FOR SELECT TO authenticated, anon USING (true);
-DROP POLICY IF EXISTS "Grade notifications insertable by staff" ON public.grade_notifications;
-CREATE POLICY "Grade notifications insertable by staff" ON public.grade_notifications FOR INSERT TO authenticated, anon WITH CHECK (true);
+CREATE POLICY "Grade notifications readable by staff" ON public.grade_notifications
+  FOR SELECT TO authenticated USING (public.get_my_role() IN ('admin', 'guru', 'wali_kelas'));
 
-INSERT INTO public.school_settings (school_name, npsn)
-SELECT 'SMA PASUNDAN 9 BANDUNG', '20219784'
+DROP POLICY IF EXISTS "Grade notifications insertable by staff" ON public.grade_notifications;
+CREATE POLICY "Grade notifications insertable by staff" ON public.grade_notifications
+  FOR INSERT TO authenticated WITH CHECK (public.get_my_role() IN ('admin', 'guru', 'wali_kelas'));
+
+-- ============================================================================
+-- SUPABASE STORAGE BUCKET (Foto Siswa & Logo Sekolah) - AMAN JIKA SUDAH ADA
+-- ============================================================================
+DO $$ BEGIN
+  INSERT INTO storage.buckets (id, name, public)
+  VALUES ('school-assets', 'school-assets', true)
+  ON CONFLICT (id) DO NOTHING;
+EXCEPTION WHEN OTHERS THEN null;
+END $$;
+
+DO $$ BEGIN
+  DROP POLICY IF EXISTS "Public read school assets" ON storage.objects;
+  CREATE POLICY "Public read school assets" ON storage.objects
+    FOR SELECT USING (bucket_id = 'school-assets');
+
+  DROP POLICY IF EXISTS "Authenticated upload school assets" ON storage.objects;
+  CREATE POLICY "Authenticated upload school assets" ON storage.objects
+    FOR INSERT TO authenticated WITH CHECK (bucket_id = 'school-assets');
+
+  DROP POLICY IF EXISTS "Authenticated update school assets" ON storage.objects;
+  CREATE POLICY "Authenticated update school assets" ON storage.objects
+    FOR UPDATE TO authenticated USING (bucket_id = 'school-assets');
+
+  DROP POLICY IF EXISTS "Authenticated delete school assets" ON storage.objects;
+  CREATE POLICY "Authenticated delete school assets" ON storage.objects
+    FOR DELETE TO authenticated USING (bucket_id = 'school-assets');
+EXCEPTION WHEN insufficient_privilege OR duplicate_object OR undefined_table THEN null;
+END $$;
+
+-- ============================================================================
+-- DATA AWAL DEFAULT (SMA PASUNDAN 9 BANDUNG) - ID DETERMINISTIK
+-- ============================================================================
+INSERT INTO public.school_settings (
+  id, yayasan, school_name, npsn, address, academic_year, semester,
+  principal_name, principal_nip, default_kktp, threshold_baik
+)
+SELECT
+  '00000000-0000-4000-8000-000000000001'::uuid,
+  'YAYASAN PENDIDIKAN DASAR DAN MENENGAH PASUNDAN',
+  'SMA PASUNDAN 9 BANDUNG',
+  '20219784',
+  'Jl. Babakan Ciparay - Gg. Atakiria I No. 28 Telp. 022-6038372 Bandung 40233',
+  '2025/2026',
+  'Ganjil',
+  'Ahmad Mukhlis Sadid, S.Pd.I., SIP.',
+  '19023L0550260241079529',
+  70,
+  90
 WHERE NOT EXISTS (SELECT 1 FROM public.school_settings);
 
+-- ============================================================================
+-- SUPABASE REALTIME (AMAN UNTUK ALL TABLES MAUPUN TABEL SPESIFIK)
+-- ============================================================================
 DO $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime' AND NOT puballtables) THEN
-    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'student_grades') THEN
+  IF EXISTS (
+    SELECT 1 FROM pg_publication
+    WHERE pubname = 'supabase_realtime' AND NOT puballtables
+  ) THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_publication_tables
+      WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'student_grades'
+    ) THEN
       ALTER PUBLICATION supabase_realtime ADD TABLE public.student_grades;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'grade_notifications') THEN
+
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_publication_tables
+      WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'grade_notifications'
+    ) THEN
       ALTER PUBLICATION supabase_realtime ADD TABLE public.grade_notifications;
     END IF;
   END IF;
 EXCEPTION WHEN OTHERS THEN null;
-END $$;`;
+END $$;
+`;
 
 export function MasterDataView() {
   const {
@@ -496,8 +1063,13 @@ export function MasterDataView() {
     category: 'Umum' as Subject['category'],
     faseScope: 'ALL' as SubjectFaseScope,
     kktp: 70,
+    teacherId: '',
     teacherName: '',
   });
+  const [classSubjectFeedback, setClassSubjectFeedback] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
 
   const existingCfg = getSupabaseConfig();
   const [sbUrl, setSbUrl] = useState(existingCfg.url);
@@ -534,7 +1106,13 @@ export function MasterDataView() {
 
   const handleAddStudent = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newStudent.nis.trim() || !newStudent.fullName.trim()) return;
+    const cleanNis = newStudent.nis.trim();
+    const cleanName = newStudent.fullName.trim();
+    if (!cleanNis || !cleanName) return;
+    if (students.some((s) => s.nis.trim() === cleanNis)) {
+      setImportStatus(`NIS ${cleanNis} sudah terdaftar. Gunakan NIS berbeda.`);
+      return;
+    }
     const targetClassId = newStudent.classId || classes[0]?.id || '';
     if (!targetClassId) {
       setImportStatus('Tambahkan minimal 1 kelas di tab Kelas & Mapel sebelum menambah siswa.');
@@ -542,9 +1120,9 @@ export function MasterDataView() {
     }
     const item: Student = {
       id: generateUuid(),
-      nis: newStudent.nis.trim(),
+      nis: cleanNis,
       nisn: newStudent.nisn.trim(),
-      fullName: newStudent.fullName.trim(),
+      fullName: cleanName,
       gender: newStudent.gender,
       classId: targetClassId,
       birthPlace: 'Bandung',
@@ -555,6 +1133,7 @@ export function MasterDataView() {
       isActive: true,
     };
     setStudents((prev) => [...prev, item]);
+    setImportStatus(`Berhasil menambahkan siswa ${cleanName} (${cleanNis}).`);
     setNewStudent({ ...newStudent, nis: '', nisn: '', fullName: '', parentName: '' });
   };
 
@@ -582,27 +1161,55 @@ export function MasterDataView() {
     }
     try {
       const rows = await parseMasterStudentsExcel(file);
-      const next: Student[] = rows.map((r) => {
-        const matchedClass =
-          classes.find((c) => c.name.toLowerCase() === r.className.toLowerCase()) ||
-          classes[0];
-        return {
-          id: generateUuid(),
-          nis: r.nis,
-          nisn: r.nisn,
-          fullName: r.fullName,
-          gender: r.gender,
-          classId: matchedClass.id,
-          birthPlace: r.birthPlace,
-          birthDate: r.birthDate,
-          religion: r.religion,
-          parentName: r.parentName,
-          address: r.address,
-          isActive: true,
-        };
+      let addedCount = 0;
+      let updatedCount = 0;
+      setStudents((prev) => {
+        const byNis = new Map<string, Student>();
+        prev.forEach((s) => byNis.set(s.nis.trim(), s));
+        rows.forEach((r) => {
+          const cleanNis = r.nis.trim();
+          const matchedClass =
+            classes.find((c) => c.name.toLowerCase() === r.className.toLowerCase()) ||
+            classes[0];
+          const existing = byNis.get(cleanNis);
+          if (existing) {
+            updatedCount += 1;
+            byNis.set(cleanNis, {
+              ...existing,
+              nisn: r.nisn || existing.nisn,
+              fullName: r.fullName,
+              gender: r.gender,
+              classId: matchedClass.id,
+              birthPlace: r.birthPlace,
+              birthDate: r.birthDate,
+              religion: r.religion,
+              parentName: r.parentName,
+              address: r.address,
+              isActive: true,
+            });
+          } else {
+            addedCount += 1;
+            byNis.set(cleanNis, {
+              id: generateUuid(),
+              nis: cleanNis,
+              nisn: r.nisn,
+              fullName: r.fullName,
+              gender: r.gender,
+              classId: matchedClass.id,
+              birthPlace: r.birthPlace,
+              birthDate: r.birthDate,
+              religion: r.religion,
+              parentName: r.parentName,
+              address: r.address,
+              isActive: true,
+            });
+          }
+        });
+        return Array.from(byNis.values());
       });
-      setStudents((prev) => [...prev, ...next]);
-      setImportStatus(`Berhasil menambahkan ${next.length} data siswa dari Excel.`);
+      setImportStatus(
+        `Import selesai: ${addedCount} siswa baru ditambahkan, ${updatedCount} siswa diperbarui berdasarkan NIS.`
+      );
     } catch {
       setImportStatus('Gagal membaca berkas Excel siswa.');
     } finally {
@@ -612,32 +1219,79 @@ export function MasterDataView() {
 
   const handleAddClass = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newClass.name.trim()) return;
+    const cleanName = newClass.name.trim();
+    if (!cleanName) return;
+    if (classes.some((c) => c.name.trim().toLowerCase() === cleanName.toLowerCase())) {
+      setClassSubjectFeedback({
+        ok: false,
+        text: `Kelas "${cleanName}" sudah ada. Gunakan nama kelas yang unik.`,
+      });
+      return;
+    }
     const item: ClassRoom = {
       id: generateUuid(),
-      name: newClass.name.trim(),
+      name: cleanName,
       gradeLevel: newClass.gradeLevel,
       fase: newClass.gradeLevel === 10 ? 'E' : 'F',
       academicYear: settings.academicYear,
     };
     setClasses((prev) => [...prev, item]);
+    setClassSubjectFeedback({ ok: true, text: `Kelas ${cleanName} berhasil ditambahkan.` });
     setNewClass({ name: '', gradeLevel: 10, fase: 'E' });
+  };
+
+  const handleAssignClassHomeroom = async (cls: ClassRoom, nextTeacherId: string) => {
+    const cleanNextId = nextTeacherId || undefined;
+    const prevTeacherId = cls.homeroomTeacherId;
+    setClasses((prev) =>
+      prev.map((c) => (c.id === cls.id ? { ...c, homeroomTeacherId: cleanNextId } : c))
+    );
+    if (prevTeacherId && prevTeacherId !== cleanNextId) {
+      const prevUser = users.find((u) => u.id === prevTeacherId);
+      if (prevUser?.role === 'wali_kelas' && prevUser.assignedClassId === cls.id) {
+        await updateUserAccount(prevUser.id, { assignedClassId: null });
+      }
+    }
+    if (cleanNextId) {
+      const nextUser = users.find((u) => u.id === cleanNextId);
+      if (nextUser?.role === 'wali_kelas' && nextUser.assignedClassId !== cls.id) {
+        await updateUserAccount(nextUser.id, { assignedClassId: cls.id });
+      }
+    }
   };
 
   const handleAddSubject = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newSubject.code.trim() || !newSubject.name.trim()) return;
+    const cleanCode = newSubject.code.trim().toUpperCase();
+    const cleanName = newSubject.name.trim();
+    if (!cleanCode || !cleanName) return;
+    if (
+      subjects.some(
+        (s) =>
+          s.code.trim().toUpperCase() === cleanCode &&
+          s.faseScope === newSubject.faseScope
+      )
+    ) {
+      setClassSubjectFeedback({
+        ok: false,
+        text: `Kode mapel "${cleanCode}" pada cakupan fase tersebut sudah terdaftar.`,
+      });
+      return;
+    }
+    const assignedTeacher = users.find((u) => u.id === newSubject.teacherId);
     const id = generateUuid();
     const item: Subject = {
       id,
-      code: newSubject.code.trim().toUpperCase(),
-      name: newSubject.name.trim(),
+      code: cleanCode,
+      name: cleanName,
       category: newSubject.category,
       faseScope: newSubject.faseScope,
       kktp: newSubject.kktp,
-      teacherName: newSubject.teacherName.trim() || 'Guru Mapel',
+      teacherId: assignedTeacher?.id || undefined,
+      teacherName: assignedTeacher?.fullName || newSubject.teacherName.trim() || 'Guru Mapel',
+      teacherNip: assignedTeacher ? assignedTeacher.nrks || assignedTeacher.nipNuptk : undefined,
       sortOrder: subjects.length + 1,
-      sasTitle: `Evaluasi Akhir ${newSubject.name.trim()}`,
+      sasTitle: `Evaluasi Akhir ${cleanName}`,
       tpList: [
         { id: generateUuid(), code: 'Sumatif 1', title: 'memahami konsep dasar materi' },
         { id: generateUuid(), code: 'Sumatif 2', title: 'menganalisis penerapan materi' },
@@ -646,12 +1300,17 @@ export function MasterDataView() {
       ],
     };
     setSubjects((prev) => [...prev, item]);
+    setClassSubjectFeedback({
+      ok: true,
+      text: `Mata pelajaran ${cleanName} (${cleanCode}) berhasil ditambahkan.`,
+    });
     setNewSubject({
       code: '',
       name: '',
       category: 'Umum',
       faseScope: 'ALL',
       kktp: 70,
+      teacherId: '',
       teacherName: '',
     });
   };
@@ -897,13 +1556,24 @@ export function MasterDataView() {
                   ))
                 )}
               </select>
-              <button
-                type="submit"
-                className="sm:col-span-2 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Tambah Siswa</span>
-              </button>
+              <input
+                type="text"
+                placeholder="Nama Orang Tua / Wali"
+                value={newStudent.parentName}
+                onChange={(e) =>
+                  setNewStudent({ ...newStudent, parentName: e.target.value })
+                }
+                className="sm:col-span-2 px-3 py-2 text-xs border border-slate-200 rounded-lg"
+              />
+              <div className="sm:col-span-12 flex justify-end">
+                <button
+                  type="submit"
+                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Tambah Siswa</span>
+                </button>
+              </div>
             </form>
           </div>
 
@@ -1015,242 +1685,306 @@ export function MasterDataView() {
 
       {/* TAB 2: KELAS & MATA PELAJARAN */}
       {tab === 'kelas_mapel' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-          {/* Kelas */}
-          <div className="lg:col-span-5 bg-white border border-slate-200/90 rounded-2xl p-5 shadow-xs space-y-4">
-            <h3 className="text-sm font-semibold text-slate-900">
-              Manajemen Kelas (Fase E & F)
-            </h3>
-            <form onSubmit={handleAddClass} className="flex gap-2">
-              <input
-                type="text"
-                placeholder="Nama Kelas (cth: X IPAS 2)"
-                value={newClass.name}
-                onChange={(e) => setNewClass({ ...newClass, name: e.target.value })}
-                className="flex-1 px-3 py-2 text-xs border border-slate-200 rounded-lg"
-              />
-              <select
-                value={newClass.gradeLevel}
-                onChange={(e) => {
-                  const lvl = Number(e.target.value) as 10 | 11 | 12;
-                  setNewClass({
-                    ...newClass,
-                    gradeLevel: lvl,
-                    fase: lvl === 10 ? 'E' : 'F',
-                  });
-                }}
-                className="px-2.5 py-2 text-xs border border-slate-200 rounded-lg bg-white"
-              >
-                <option value={10}>Kelas X (Fase E)</option>
-                <option value={11}>Kelas XI (Fase F)</option>
-                <option value={12}>Kelas XII (Fase F)</option>
-              </select>
+        <div className="space-y-4">
+          {classSubjectFeedback && (
+            <div
+              className={`p-3 rounded-xl border text-xs flex items-center justify-between gap-3 ${
+                classSubjectFeedback.ok
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-red-50 border-red-200 text-red-700'
+              }`}
+            >
+              <span>{classSubjectFeedback.text}</span>
               <button
-                type="submit"
-                className="px-3 py-2 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg"
+                type="button"
+                onClick={() => setClassSubjectFeedback(null)}
+                className="underline shrink-0"
               >
-                Tambah
+                Tutup
               </button>
-            </form>
+            </div>
+          )}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            {/* Kelas */}
+            <div className="lg:col-span-5 bg-white border border-slate-200/90 rounded-2xl p-5 shadow-xs space-y-4">
+              <h3 className="text-sm font-semibold text-slate-900">
+                Manajemen Kelas (Fase E & F)
+              </h3>
+              <form onSubmit={handleAddClass} className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="Nama Kelas (cth: X IPAS 2)"
+                  value={newClass.name}
+                  onChange={(e) => setNewClass({ ...newClass, name: e.target.value })}
+                  className="flex-1 px-3 py-2 text-xs border border-slate-200 rounded-lg"
+                />
+                <select
+                  value={newClass.gradeLevel}
+                  onChange={(e) => {
+                    const lvl = Number(e.target.value) as 10 | 11 | 12;
+                    setNewClass({
+                      ...newClass,
+                      gradeLevel: lvl,
+                      fase: lvl === 10 ? 'E' : 'F',
+                    });
+                  }}
+                  className="px-2.5 py-2 text-xs border border-slate-200 rounded-lg bg-white"
+                >
+                  <option value={10}>Kelas X (Fase E)</option>
+                  <option value={11}>Kelas XI (Fase F)</option>
+                  <option value={12}>Kelas XII (Fase F)</option>
+                </select>
+                <button
+                  type="submit"
+                  className="px-3 py-2 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg"
+                >
+                  Tambah
+                </button>
+              </form>
 
-            <div className="divide-y divide-slate-100">
-              {classes.length === 0 ? (
-                <p className="py-6 text-center text-xs text-slate-500">
-                  Belum ada data kelas di Supabase. Tambahkan kelas baru di atas.
+              <div className="divide-y divide-slate-100">
+                {classes.length === 0 ? (
+                  <p className="py-6 text-center text-xs text-slate-500">
+                    Belum ada data kelas di Supabase. Tambahkan kelas baru di atas.
+                  </p>
+                ) : (
+                  classes.map((cls) => {
+                    const wali = users.find((u) => u.id === cls.homeroomTeacherId);
+                    return (
+                      <div
+                        key={cls.id}
+                        className="py-3 flex items-center justify-between gap-3 text-xs"
+                      >
+                        <div>
+                          <div className="font-semibold text-slate-900">
+                            {cls.name} · Fase {cls.fase}
+                          </div>
+                          <div className="text-slate-500">
+                            Wali: {wali?.fullName || 'Belum ditentukan'}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <select
+                            value={cls.homeroomTeacherId || ''}
+                            onChange={(e) => handleAssignClassHomeroom(cls, e.target.value)}
+                            className="px-2 py-1 text-xs border border-slate-200 rounded-md bg-white max-w-[150px]"
+                          >
+                            <option value="">Pilih Wali Kelas</option>
+                            {users.map((u) => (
+                              <option key={u.id} value={u.id}>
+                                {u.fullName}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setClasses((prev) => prev.filter((c) => c.id !== cls.id));
+                              const client = getSupabaseClient();
+                              if (client && isUuid(cls.id)) {
+                                client.from('classes').delete().eq('id', cls.id).then(() => {});
+                              }
+                            }}
+                            className="p-1.5 text-slate-400 hover:text-red-600"
+                            title="Hapus kelas"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            {/* Mata Pelajaran */}
+            <div className="lg:col-span-7 bg-white border border-slate-200/90 rounded-2xl p-5 shadow-xs space-y-4">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900">
+                  Struktur Mata Pelajaran SMA Kurikulum Merdeka & KKTP
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Fase E (Kelas X): Umum + IPA/IPS Terpadu + Informatika. Fase F (Kelas XI & XII): Umum + Mapel Pilihan + Mulok.
                 </p>
-              ) : (
-                classes.map((cls) => {
-                  const wali = users.find((u) => u.id === cls.homeroomTeacherId);
-                  return (
+              </div>
+              <form
+                onSubmit={handleAddSubject}
+                className="grid grid-cols-1 sm:grid-cols-12 gap-2"
+              >
+                <input
+                  type="text"
+                  placeholder="Kode"
+                  value={newSubject.code}
+                  onChange={(e) => setNewSubject({ ...newSubject, code: e.target.value })}
+                  className="sm:col-span-2 px-2.5 py-2 text-xs border border-slate-200 rounded-lg font-mono uppercase"
+                />
+                <input
+                  type="text"
+                  placeholder="Nama Mata Pelajaran"
+                  value={newSubject.name}
+                  onChange={(e) => setNewSubject({ ...newSubject, name: e.target.value })}
+                  className="sm:col-span-3 px-2.5 py-2 text-xs border border-slate-200 rounded-lg"
+                />
+                <select
+                  value={newSubject.category}
+                  onChange={(e) =>
+                    setNewSubject({
+                      ...newSubject,
+                      category: e.target.value as Subject['category'],
+                    })
+                  }
+                  className="sm:col-span-2 px-2 py-2 text-xs border border-slate-200 rounded-lg bg-white"
+                >
+                  <option value="Umum">Kel. Umum</option>
+                  <option value="Pilihan">Kel. Pilihan</option>
+                  <option value="Muatan Lokal">Mulok</option>
+                </select>
+                <select
+                  value={newSubject.faseScope}
+                  onChange={(e) =>
+                    setNewSubject({
+                      ...newSubject,
+                      faseScope: e.target.value as SubjectFaseScope,
+                    })
+                  }
+                  className="sm:col-span-2 px-2 py-2 text-xs border border-slate-200 rounded-lg bg-white"
+                >
+                  <option value="ALL">Fase E & F</option>
+                  <option value="E">Khusus Fase E (X)</option>
+                  <option value="F">Khusus Fase F (XI/XII)</option>
+                </select>
+                <select
+                  value={newSubject.teacherId}
+                  onChange={(e) => {
+                    const selected = users.find((u) => u.id === e.target.value);
+                    setNewSubject({
+                      ...newSubject,
+                      teacherId: e.target.value,
+                      teacherName: selected?.fullName || '',
+                    });
+                  }}
+                  className="sm:col-span-2 px-2 py-2 text-xs border border-slate-200 rounded-lg bg-white"
+                  title="Guru Pengampu"
+                >
+                  <option value="">Pilih Guru</option>
+                  {users.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.fullName}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  placeholder="KKTP"
+                  value={newSubject.kktp}
+                  onChange={(e) =>
+                    setNewSubject({ ...newSubject, kktp: Number(e.target.value) || 70 })
+                  }
+                  className="sm:col-span-1 px-1.5 py-2 text-xs border border-slate-200 rounded-lg font-mono text-center"
+                />
+                <div className="sm:col-span-12 flex justify-end">
+                  <button
+                    type="submit"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Tambah Mapel</span>
+                  </button>
+                </div>
+              </form>
+
+              <div className="divide-y divide-slate-100 max-h-[520px] overflow-y-auto pr-1">
+                {subjects.length === 0 ? (
+                  <p className="py-6 text-center text-xs text-slate-500">
+                    Belum ada data mata pelajaran di Supabase. Tambahkan mata pelajaran baru di atas.
+                  </p>
+                ) : (
+                  subjects.map((sub) => (
                     <div
-                      key={cls.id}
-                      className="py-3 flex items-center justify-between gap-3 text-xs"
+                      key={sub.id}
+                      className="py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs"
                     >
                       <div>
                         <div className="font-semibold text-slate-900">
-                          {cls.name} · Fase {cls.fase}
+                          {sub.name} ({sub.code})
                         </div>
                         <div className="text-slate-500">
-                          Wali: {wali?.fullName || 'Belum ditentukan'}
+                          Kelompok {sub.category} ·{' '}
+                          {sub.faseScope === 'ALL'
+                            ? 'Fase E & F'
+                            : sub.faseScope === 'E'
+                              ? 'Khusus Fase E (Kelas X)'
+                              : 'Khusus Fase F (Kelas XI/XII)'}{' '}
+                          · Guru: {sub.teacherName || '-'}
                         </div>
                       </div>
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-2">
                         <select
-                          value={cls.homeroomTeacherId || ''}
-                          onChange={(e) =>
-                            setClasses((prev) =>
-                              prev.map((c) =>
-                                c.id === cls.id
-                                  ? { ...c, homeroomTeacherId: e.target.value || undefined }
-                                  : c
+                          value={sub.teacherId || ''}
+                          onChange={(e) => {
+                            const selected = users.find((u) => u.id === e.target.value);
+                            setSubjects((prev) =>
+                              prev.map((s) =>
+                                s.id === sub.id
+                                  ? {
+                                      ...s,
+                                      teacherId: selected?.id || undefined,
+                                      teacherName: selected?.fullName || 'Guru Mapel',
+                                      teacherNip: selected
+                                        ? selected.nrks || selected.nipNuptk
+                                        : undefined,
+                                    }
+                                  : s
                               )
-                            )
-                          }
+                            );
+                          }}
                           className="px-2 py-1 text-xs border border-slate-200 rounded-md bg-white max-w-[150px]"
+                          title="Guru Pengampu"
                         >
-                          <option value="">Pilih Wali Kelas</option>
+                          <option value="">Pilih Guru Pengampu</option>
                           {users.map((u) => (
                             <option key={u.id} value={u.id}>
                               {u.fullName}
                             </option>
                           ))}
                         </select>
+                        <label className="text-[11px] text-slate-500">KKTP</label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={100}
+                          value={sub.kktp}
+                          onChange={(e) =>
+                            setSubjects((prev) =>
+                              prev.map((s) =>
+                                s.id === sub.id
+                                  ? { ...s, kktp: Number(e.target.value) || 70 }
+                                  : s
+                              )
+                            )
+                          }
+                          className="w-14 px-2 py-1 text-center font-mono border border-slate-200 rounded-md"
+                        />
                         <button
                           type="button"
                           onClick={() => {
-                            setClasses((prev) => prev.filter((c) => c.id !== cls.id));
+                            setSubjects((prev) => prev.filter((s) => s.id !== sub.id));
                             const client = getSupabaseClient();
-                            if (client && isUuid(cls.id)) {
-                              client.from('classes').delete().eq('id', cls.id).then(() => {});
+                            if (client && isUuid(sub.id)) {
+                              client.from('subjects').delete().eq('id', sub.id).then(() => {});
                             }
                           }}
                           className="p-1.5 text-slate-400 hover:text-red-600"
-                          title="Hapus kelas"
+                          title="Hapus mata pelajaran"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-
-          {/* Mata Pelajaran */}
-          <div className="lg:col-span-7 bg-white border border-slate-200/90 rounded-2xl p-5 shadow-xs space-y-4">
-            <div>
-              <h3 className="text-sm font-semibold text-slate-900">
-                Struktur Mata Pelajaran SMA Kurikulum Merdeka & KKTP
-              </h3>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Fase E (Kelas X): Umum + IPA/IPS Terpadu + Informatika. Fase F (Kelas XI & XII): Umum + Mapel Pilihan + Mulok.
-              </p>
-            </div>
-            <form
-              onSubmit={handleAddSubject}
-              className="grid grid-cols-1 sm:grid-cols-12 gap-2"
-            >
-              <input
-                type="text"
-                placeholder="Kode"
-                value={newSubject.code}
-                onChange={(e) => setNewSubject({ ...newSubject, code: e.target.value })}
-                className="sm:col-span-2 px-2.5 py-2 text-xs border border-slate-200 rounded-lg font-mono uppercase"
-              />
-              <input
-                type="text"
-                placeholder="Nama Mata Pelajaran"
-                value={newSubject.name}
-                onChange={(e) => setNewSubject({ ...newSubject, name: e.target.value })}
-                className="sm:col-span-4 px-2.5 py-2 text-xs border border-slate-200 rounded-lg"
-              />
-              <select
-                value={newSubject.category}
-                onChange={(e) =>
-                  setNewSubject({
-                    ...newSubject,
-                    category: e.target.value as Subject['category'],
-                  })
-                }
-                className="sm:col-span-2 px-2 py-2 text-xs border border-slate-200 rounded-lg bg-white"
-              >
-                <option value="Umum">Kel. Umum</option>
-                <option value="Pilihan">Kel. Pilihan</option>
-                <option value="Muatan Lokal">Mulok</option>
-              </select>
-              <select
-                value={newSubject.faseScope}
-                onChange={(e) =>
-                  setNewSubject({
-                    ...newSubject,
-                    faseScope: e.target.value as SubjectFaseScope,
-                  })
-                }
-                className="sm:col-span-2 px-2 py-2 text-xs border border-slate-200 rounded-lg bg-white"
-              >
-                <option value="ALL">Fase E & F</option>
-                <option value="E">Khusus Fase E (X)</option>
-                <option value="F">Khusus Fase F (XI/XII)</option>
-              </select>
-              <input
-                type="number"
-                placeholder="KKTP"
-                value={newSubject.kktp}
-                onChange={(e) =>
-                  setNewSubject({ ...newSubject, kktp: Number(e.target.value) || 70 })
-                }
-                className="sm:col-span-1 px-2 py-2 text-xs border border-slate-200 rounded-lg font-mono text-center"
-              />
-              <button
-                type="submit"
-                className="sm:col-span-1 px-2 py-2 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg"
-              >
-                +
-              </button>
-            </form>
-
-            <div className="divide-y divide-slate-100 max-h-[520px] overflow-y-auto pr-1">
-              {subjects.length === 0 ? (
-                <p className="py-6 text-center text-xs text-slate-500">
-                  Belum ada data mata pelajaran di Supabase. Tambahkan mata pelajaran baru di atas.
-                </p>
-              ) : (
-                subjects.map((sub) => (
-                  <div
-                    key={sub.id}
-                    className="py-2.5 flex items-center justify-between gap-3 text-xs"
-                  >
-                    <div>
-                      <div className="font-semibold text-slate-900">
-                        {sub.name} ({sub.code})
-                      </div>
-                      <div className="text-slate-500">
-                        Kelompok {sub.category} ·{' '}
-                        {sub.faseScope === 'ALL'
-                          ? 'Fase E & F'
-                          : sub.faseScope === 'E'
-                            ? 'Khusus Fase E (Kelas X)'
-                            : 'Khusus Fase F (Kelas XI/XII)'}{' '}
-                        · Guru: {sub.teacherName || '-'}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <label className="text-[11px] text-slate-500">KKTP</label>
-                      <input
-                        type="number"
-                        min={0}
-                        max={100}
-                        value={sub.kktp}
-                        onChange={(e) =>
-                          setSubjects((prev) =>
-                            prev.map((s) =>
-                              s.id === sub.id
-                                ? { ...s, kktp: Number(e.target.value) || 70 }
-                                : s
-                            )
-                          )
-                        }
-                        className="w-14 px-2 py-1 text-center font-mono border border-slate-200 rounded-md"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSubjects((prev) => prev.filter((s) => s.id !== sub.id));
-                          const client = getSupabaseClient();
-                          if (client && isUuid(sub.id)) {
-                            client.from('subjects').delete().eq('id', sub.id).then(() => {});
-                          }
-                        }}
-                        className="p-1.5 text-slate-400 hover:text-red-600"
-                        title="Hapus mata pelajaran"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                ))
-              )}
+                  ))
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -1350,6 +2084,7 @@ export function MasterDataView() {
                 type="password"
                 required
                 minLength={6}
+                autoComplete="new-password"
                 placeholder="Kata Sandi (min. 6) *"
                 value={newUser.password}
                 onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
@@ -1506,6 +2241,7 @@ export function MasterDataView() {
                                   type="password"
                                   required
                                   minLength={6}
+                                  autoComplete="new-password"
                                   placeholder="Sandi baru"
                                   value={resetPwValue}
                                   onChange={(e) => setResetPwValue(e.target.value)}

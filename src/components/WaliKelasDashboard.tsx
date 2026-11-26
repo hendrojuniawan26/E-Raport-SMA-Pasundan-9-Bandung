@@ -199,7 +199,11 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
     const raw = classStudents.map((stu) => {
       const subjectDetails = classSubjects.map((sub) => {
         const found = grades.find(
-          (g) => g.studentId === stu.id && g.subjectId === sub.id
+          (g) =>
+            g.studentId === stu.id &&
+            g.subjectId === sub.id &&
+            g.academicYear === settings.academicYear &&
+            g.semester === settings.semester
         );
         const calc = found ? recalculateSubjectGrade(found, sub, settings) : null;
         return {
@@ -218,7 +222,12 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
         .filter((d) => d.score < d.subject.kktp)
         .map((d) => d.subject.name);
 
-      const hr = homeroomRecords.find((r) => r.studentId === stu.id);
+      const hr = homeroomRecords.find(
+        (r) =>
+          r.studentId === stu.id &&
+          r.academicYear === settings.academicYear &&
+          r.semester === settings.semester
+      );
       const sakit = hr?.sakit ?? 0;
       const izin = hr?.izin ?? 0;
       const alpha = hr?.alpha ?? 0;
@@ -332,7 +341,11 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
       const valid = classStudents
         .map((stu) => {
           const found = grades.find(
-            (g) => g.studentId === stu.id && g.subjectId === sub.id
+            (g) =>
+              g.studentId === stu.id &&
+              g.subjectId === sub.id &&
+              g.academicYear === settings.academicYear &&
+              g.semester === settings.semester
           );
           return found ? recalculateSubjectGrade(found, sub, settings) : null;
         })
@@ -714,8 +727,14 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
             </div>
           ) : (
             <>
-              <div className="h-[260px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
+              <div className="h-[260px] w-full min-w-0">
+                <ResponsiveContainer
+                  width="100%"
+                  height="100%"
+                  minWidth={0}
+                  minHeight={0}
+                  initialDimension={{ width: 480, height: 260 }}
+                >
                   <BarChart
                     data={distributionData}
                     margin={{ top: 12, right: 12, left: -16, bottom: 4 }}
@@ -740,8 +759,12 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
                       radius={[8, 8, 0, 0]}
                       maxBarSize={56}
                       onClick={(entry) => {
-                        const bucket = entry?.payload as DistributionBucket | undefined;
-                        if (bucket) {
+                        const bucket =
+                          entry && typeof entry === 'object'
+                            ? ((entry as { payload?: DistributionBucket }).payload ??
+                              (entry as unknown as DistributionBucket))
+                            : undefined;
+                        if (bucket?.id) {
                           setSelectedBucketId((prev) => (prev === bucket.id ? null : bucket.id));
                         }
                       }}
@@ -808,8 +831,14 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
             </div>
           ) : (
             <div className="flex-1 flex flex-col justify-between gap-4">
-              <div className="relative h-[210px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
+              <div className="relative h-[210px] w-full min-w-0">
+                <ResponsiveContainer
+                  width="100%"
+                  height="100%"
+                  minWidth={0}
+                  minHeight={0}
+                  initialDimension={{ width: 320, height: 210 }}
+                >
                   <PieChart>
                     <Pie
                       data={predikatPieData.filter((d) => d.value > 0)}
@@ -889,8 +918,14 @@ export function WaliKelasDashboard({ embedded = false }: { embedded?: boolean })
           </button>
         </div>
 
-        <div className="h-[250px] w-full">
-          <ResponsiveContainer width="100%" height="100%">
+        <div className="h-[250px] w-full min-w-0">
+          <ResponsiveContainer
+            width="100%"
+            height="100%"
+            minWidth={0}
+            minHeight={0}
+            initialDimension={{ width: 640, height: 250 }}
+          >
             <BarChart
               data={subjectChartData}
               margin={{ top: 14, right: 16, left: -12, bottom: 4 }}
